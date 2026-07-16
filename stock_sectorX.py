@@ -166,40 +166,42 @@ for ticker in tickers:
         continue
 
     # ==========================================
-    # ★ 4. 策略條件篩選
+    # ★ 策略條件篩選 (抓底部起漲點版本)
     # ==========================================
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # 判斷邏輯 1：站上月線
-    is_above_ma20 = latest['Close'] > latest['MA20']
+    # 1. 均線糾結且剛突破
+    ma_max = max(latest['MA5'], latest['MA20'], latest['MA60'])
+    ma_min = min(latest['MA5'], latest['MA20'], latest['MA60'])
+    is_ma_tangled = ((ma_max - ma_min) / ma_min) < 0.05
+    is_breaking_out = latest['Close'] > ma_max
 
-    # 判斷邏輯 2：KD 黃金交叉 (今日 K>D 且 昨日 K<=D)
-    is_kd_golden = (latest['K'] > latest['D']) and (prev['K'] <= prev['D'])
+    # 2. KD 低檔黃金交叉 (K<30)
+    is_kd_low_golden = (latest['K'] > latest['D']) and (prev['K'] <= prev['D']) and (prev['K'] < 30)
 
-    # 判斷邏輯 3：流動性過濾 (確保 5 日均量 > 500 張，避免買到殭屍股)
+    # 3. MACD 動能翻紅
+    is_macd_red = latest['OSC'] > 0
+
+    # 4. 溫和放量 (1.5倍) 與基本流動性 (500張)
     is_liquid = latest['Volume_MA5'] > (500 * 1000)
-
-    # 判斷邏輯 4：爆量表態 (今日成交量 > 5日均量 * 2)
     is_vol_surge = latest['Volume'] > (latest['Volume_MA5'] * 1.2)
 
-    # 綜合判斷：必須同時符合這 4 個條件
-    if is_above_ma20 and is_kd_golden and is_liquid and is_vol_surge:
+    # ★ 綜合判斷：只要滿足低檔起漲核心條件就選出
+    if is_kd_low_golden and is_breaking_out and is_ma_tangled and is_macd_red and is_liquid and is_vol_surge:
         vol_in_lots = latest['Volume'] / 1000
         vol_ma5_lots = latest['Volume_MA5'] / 1000
         strong_watchlist.append(
             f"⭐ {ticker} (收盤: {latest['Close']:.2f}, "
-            f"月線: {latest['MA20']:.2f}, "
-            f"量增: {vol_in_lots:,.0f}張 / 均量: {vol_ma5_lots:,.0f}張)"
+            f"量增: {vol_in_lots:,.0f}張, 底部剛突破!)"
         )
         strong_dfs[ticker] = df
-    elif is_above_ma20 and is_kd_golden and is_liquid:
-        # 符合前 3 條件但尚未爆量，列為候選觀察
+    elif is_kd_low_golden and is_ma_tangled and is_liquid:
+        # 均線糾結 + KD 低檔金叉，但尚未放量突破，列為候選觀察
         vol_ma5_lots = latest['Volume_MA5'] / 1000
         watchlist_no_surge.append(
             f"🔔 {ticker} (收盤: {latest['Close']:.2f}, "
-            f"月線: {latest['MA20']:.2f}, "
-            f"均量: {vol_ma5_lots:,.0f}張，待爆量確認)"
+            f"均量: {vol_ma5_lots:,.0f}張，均線糾結待突破)"
         )
 
     report = f"【{ticker}】 收盤: {latest['Close']:.2f} | K: {latest['K']:.2f} | D: {latest['D']:.2f} "
