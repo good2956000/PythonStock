@@ -203,7 +203,8 @@ def start_scan(request: StartScanRequest) -> StartScanResponse:
     wanted_ids = set(request.sector_ids)
     presets = [s for s in market_data.PRESET_SECTORS if s.sector_id in wanted_ids]
     needs_twse = not request.sector_ids or "0" in wanted_ids or any(not i.startswith("P") for i in wanted_ids)
-    twse_sectors = load_sectors_or_fail() if needs_twse else []
+    # 只掃描固定清單時，證交所清單僅用來查股票名稱，抓取失敗也不影響掃描
+    twse_sectors = load_sectors_or_fail() if needs_twse else sector_cache.get()
 
     if not request.sector_ids or "0" in wanted_ids:
         selected = presets + twse_sectors
@@ -213,7 +214,8 @@ def start_scan(request: StartScanRequest) -> StartScanResponse:
         raise HTTPException(status_code=400, detail="No valid sector selected")
 
     tickers = [ticker for sector in selected for ticker in sector.tickers]
-    job = job_manager.submit([s.name for s in selected], tickers, request.strategy)
+    stock_names = market_data.build_stock_name_map(twse_sectors)
+    job = job_manager.submit([s.name for s in selected], tickers, request.strategy, stock_names)
     return StartScanResponse(job_id=job.job_id, total_count=len(job.tickers))
 
 

@@ -3,7 +3,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main
-from app.market_data import Sector, split_download_frame
+from app.market_data import Sector, build_stock_name_map, split_code_and_name, split_download_frame
 from app.scan_jobs import STATUS_COMPLETED, STATUS_FAILED, ScanJobManager
 
 API_KEY = "test-key-for-unit-tests"
@@ -27,6 +27,14 @@ class TestScanJobManager:
         assert [r.ticker for r in job.results] == ["2330.TW", "2303.TW"]
         assert job.results[0].volume_ma5_lots == 1000
 
+    def test_results_include_stock_name_when_known(self, price_frame_factory):
+        manager = ScanJobManager(price_downloader=lambda t: {x: price_frame_factory(range(100, 200)) for x in t})
+
+        job = manager.run_synchronously(["x"], ["2330.TW", "6666.TW"], stock_names={"2330.TW": "台積電"})
+
+        assert [(r.ticker, r.name) for r in job.results] == [("2330.TW", "台積電"), ("6666.TW", None)]
+        assert "stockNames" not in job.to_dict() and "stock_names" not in job.to_dict()
+
     def test_downloader_error_marks_job_failed(self):
         def broken_downloader(_):
             raise RuntimeError("Yahoo unavailable")
@@ -36,6 +44,20 @@ class TestScanJobManager:
         assert job.status == STATUS_FAILED
         assert job.error_message == "Yahoo unavailable"
         assert job.finished_at is not None
+
+
+class TestStockNames:
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [("2330　台積電", ("2330", "台積電")), ("1240 茂生農經", ("1240", "茂生農經")), ("股票", ("股票", ""))],
+    )
+    def test_split_code_and_name(self, raw, expected):
+        assert split_code_and_name(raw) == expected
+
+    def test_build_stock_name_map_merges_sectors(self):
+        sectors = [Sector("1", "a", ["2330.TW"], {"2330.TW": "台積電"}), Sector("2", "b", ["6488.TWO"], {"6488.TWO": "環球晶"})]
+
+        assert build_stock_name_map(sectors) == {"2330.TW": "台積電", "6488.TWO": "環球晶"}
 
 
 class TestSplitDownloadFrame:
@@ -55,7 +77,10 @@ class TestSplitDownloadFrame:
 @pytest.fixture
 def api_client(monkeypatch):
     monkeypatch.setenv(main.API_KEY_ENV_NAME, API_KEY)
-    sectors = [Sector("1", "半導體業", ["2330.TW", "2303.TW"]), Sector("2", "航運業", ["2603.TW"])]
+    sectors = [
+        Sector("1", "半導體業", ["2330.TW", "2303.TW"], {"2330.TW": "台積電", "2303.TW": "聯電"}),
+        Sector("2", "航運業", ["2603.TW"], {"2603.TW": "長榮"}),
+    ]
     monkeypatch.setattr(main.sector_cache, "get", lambda: sectors)
 
     submitted = {}
@@ -64,10 +89,11 @@ def api_client(monkeypatch):
         job_id = "a" * 32
         tickers = []
 
-    def fake_submit(sector_names, tickers, strategy="standard"):
+    def fake_submit(sector_names, tickers, strategy="standard", stock_names=None):
         submitted["sector_names"] = sector_names
         submitted["tickers"] = tickers
         submitted["strategy"] = strategy
+        submitted["stock_names"] = stock_names
         FakeJob.tickers = tickers
         return FakeJob
 
@@ -136,6 +162,7 @@ class TestApi:
         assert response.json() == {"jobId": "a" * 32, "totalCount": 3}
         assert api_client.submitted["sector_names"] == ["半導體業", "航運業"]
         assert api_client.submitted["strategy"] == "standard"
+        assert api_client.submitted["stock_names"]["2330.TW"] == "台積電"
 
     def test_start_scan_with_unknown_sector_returns_400(self, api_client):
         response = api_client.post("/api/scans", json={"sectorIds": ["999"]}, headers={"X-Api-Key": API_KEY})

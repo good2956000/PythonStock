@@ -5,7 +5,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from io import StringIO
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -27,6 +27,24 @@ class Sector:
     sector_id: str
     name: str
     tickers: List[str] = field(default_factory=list)
+    # ticker → 股票中文名稱（例如 "2330.TW" → "台積電"）；固定清單為空，名稱由產業族群查得
+    stock_names: Dict[str, str] = field(default_factory=dict)
+
+
+def split_code_and_name(value: str) -> Tuple[str, str]:
+    """把 ISIN 頁面的「2330　台積電」拆成 ("2330", "台積電")；沒有名稱時名稱為空字串。"""
+    parts = re.split(r"[\u3000 ]+", str(value).strip(), maxsplit=1)
+    code = parts[0].strip()
+    name = parts[1].strip() if len(parts) > 1 else ""
+    return code, name
+
+
+def build_stock_name_map(sectors: List[Sector]) -> Dict[str, str]:
+    """合併所有族群的 ticker → 名稱對照表。"""
+    names: Dict[str, str] = {}
+    for sector in sectors:
+        names.update(sector.stock_names)
+    return names
 
 
 def fetch_sectors(timeout_seconds: int = 15) -> List[Sector]:
@@ -49,9 +67,9 @@ def fetch_sectors(timeout_seconds: int = 15) -> List[Sector]:
         frame.columns = frame.iloc[0]
         frame = frame.iloc[2:]
         frame = frame.dropna(subset=["產業別"])
-        frame["代號"] = frame["有價證券代號及名稱"].apply(
-            lambda value: re.split(r"[　 ]+", str(value))[0].strip()
-        )
+        code_and_name = frame["有價證券代號及名稱"].apply(split_code_and_name)
+        frame["代號"] = code_and_name.str[0]
+        frame["名稱"] = code_and_name.str[1]
         # 只保留 4 碼數字的普通股（排除特別股、ETF、權證等）
         frame = frame[frame["代號"].str.match(r"^\d{4}$")]
 
@@ -61,7 +79,10 @@ def fetch_sectors(timeout_seconds: int = 15) -> List[Sector]:
             if sector is None:
                 sector = Sector(sector_id=str(len(sectors_by_name) + 1), name=industry)
                 sectors_by_name[industry] = sector
-            sector.tickers.append(f"{row['代號']}.{suffix}")
+            ticker = f"{row['代號']}.{suffix}"
+            sector.tickers.append(ticker)
+            if row["名稱"]:
+                sector.stock_names[ticker] = row["名稱"]
 
     return list(sectors_by_name.values())
 

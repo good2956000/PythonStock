@@ -30,6 +30,7 @@ PriceDownloader = Callable[[List[str]], Dict[str, pd.DataFrame]]
 @dataclass
 class StockScanResult:
     ticker: str
+    name: Optional[str]
     trade_date: str
     close: float
     ma20: float
@@ -48,6 +49,7 @@ class ScanJob:
     sector_names: List[str]
     tickers: List[str]
     strategy: str = STRATEGY_STANDARD
+    stock_names: Dict[str, str] = field(default_factory=dict)
     status: str = STATUS_QUEUED
     processed_count: int = 0
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -59,6 +61,7 @@ class ScanJob:
         data = asdict(self)
         data["total_count"] = len(self.tickers)
         del data["tickers"]
+        del data["stock_names"]   # 名稱已放進每筆結果，不需要整份對照表
         return data
 
 
@@ -73,10 +76,19 @@ class ScanJobManager:
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sector-scan")
 
-    def submit(self, sector_names: List[str], tickers: List[str], strategy: str = STRATEGY_STANDARD) -> ScanJob:
+    def submit(
+        self,
+        sector_names: List[str],
+        tickers: List[str],
+        strategy: str = STRATEGY_STANDARD,
+        stock_names: Optional[Dict[str, str]] = None,
+    ) -> ScanJob:
         # 去除重複並保留原順序
         unique_tickers = list(dict.fromkeys(tickers))
-        job = ScanJob(job_id=uuid.uuid4().hex, sector_names=sector_names, tickers=unique_tickers, strategy=strategy)
+        job = ScanJob(
+            job_id=uuid.uuid4().hex, sector_names=sector_names, tickers=unique_tickers,
+            strategy=strategy, stock_names=stock_names or {},
+        )
         with self._lock:
             self._jobs[job.job_id] = job
             # 只保留最近的工作，避免記憶體持續成長
@@ -91,11 +103,16 @@ class ScanJobManager:
             return job.to_dict() if job else None
 
     def run_synchronously(
-        self, sector_names: List[str], tickers: List[str], strategy: str = STRATEGY_STANDARD
+        self,
+        sector_names: List[str],
+        tickers: List[str],
+        strategy: str = STRATEGY_STANDARD,
+        stock_names: Optional[Dict[str, str]] = None,
     ) -> ScanJob:
         """測試用：不經背景執行緒直接執行。"""
         job = ScanJob(
-            job_id=uuid.uuid4().hex, sector_names=sector_names, tickers=list(dict.fromkeys(tickers)), strategy=strategy
+            job_id=uuid.uuid4().hex, sector_names=sector_names, tickers=list(dict.fromkeys(tickers)),
+            strategy=strategy, stock_names=stock_names or {},
         )
         self._run(job)
         return job
@@ -112,7 +129,10 @@ class ScanJobManager:
                 batch_results = []
                 for ticker in batch:
                     frame = price_frames.get(ticker)
-                    result = self._analyze(ticker, frame, job.strategy) if frame is not None else None
+                    result = (
+                        self._analyze(ticker, job.stock_names.get(ticker), frame, job.strategy)
+                        if frame is not None else None
+                    )
                     if result is not None:
                         batch_results.append(result)
                 with self._lock:
@@ -132,12 +152,15 @@ class ScanJobManager:
                 job.finished_at = datetime.now(timezone.utc).isoformat()
 
     @staticmethod
-    def _analyze(ticker: str, price_frame: pd.DataFrame, strategy: str) -> Optional[StockScanResult]:
+    def _analyze(
+        ticker: str, name: Optional[str], price_frame: pd.DataFrame, strategy: str
+    ) -> Optional[StockScanResult]:
         signal = evaluate_signals(add_indicators(price_frame), strategy)
         if signal is None:
             return None
         return StockScanResult(
             ticker=ticker,
+            name=name,
             trade_date=signal.trade_date,
             close=round(signal.close, 2),
             ma20=round(signal.ma20, 2),
