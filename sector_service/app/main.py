@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 from . import market_analysis, market_data, signal_analysis
-from .indicators import STRATEGY_CLASSIFIERS, STRATEGY_STANDARD, add_indicators
+from .indicators import BOTTOM_BREAKOUT_CONDITIONS, STRATEGY_CLASSIFIERS, STRATEGY_STANDARD, add_indicators
 from .scan_jobs import ScanJobManager
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,12 @@ class SectorSummary(CamelModel):
     is_preset: bool = False
 
 
+class ConditionDefinition(CamelModel):
+    # key 與掃描結果 conditions 內的鍵相同（camelCase），供前端自選條件篩選
+    key: str
+    label: str
+
+
 class StrategySummary(CamelModel):
     strategy_id: str
     name: str
@@ -62,6 +68,9 @@ class StrategySummary(CamelModel):
     strong_label: str
     watch_label: Optional[str] = None
     description: str
+    # 非空時，前端以「自選條件」取代伺服器端的觀察名單
+    condition_definitions: List[ConditionDefinition] = Field(default_factory=list)
+    default_custom_conditions: List[str] = Field(default_factory=list)
 
 
 class StartScanRequest(CamelModel):
@@ -84,10 +93,13 @@ STRATEGIES = [
     ),
     StrategySummary(
         strategy_id="bottom_breakout", name="底部起漲", source_script="stock_sectorX.py",
-        strong_label="⭐ 底部剛突破", watch_label="🔔 均線糾結待突破",
+        strong_label="⭐ 底部剛突破", watch_label="🎯 自選條件",
         description="① MA5/MA20/MA60 糾結（差距 < 5%） ② 收盤突破三條均線 ③ KD 低檔黃金交叉（昨日 K < 30） "
-                    "④ MACD 柱狀翻紅 ⑤ 5 日均量 > 500 張 ⑥ 今日量 > 5 日均量 × 1.2。"
-                    "全部符合列為底部剛突破，符合 ①③⑤ 列為均線糾結待突破。",
+                    "④ MACD 柱狀翻紅 ⑤ 5 日均量 > 500 張 ⑥ 今日量 > 5 日均量 × 1.2 ⑦ 月線大於季線（MA20 > MA60）。"
+                    "7 個條件全部符合列為底部剛突破；自選條件可任意勾選其中幾項即時篩選。",
+        condition_definitions=[ConditionDefinition(key=to_camel(key), label=label) for key, label in BOTTOM_BREAKOUT_CONDITIONS],
+        # 預設勾選原腳本「均線糾結待突破」的條件：① 均線糾結 ③ KD 低檔金叉 ⑤ 流動性
+        default_custom_conditions=[to_camel(key) for key in ("ma_tangled", "kd_low_golden_cross", "liquid")],
     ),
     StrategySummary(
         strategy_id="basic", name="月線 + KD 金叉", source_script="stock.py",

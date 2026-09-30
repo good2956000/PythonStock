@@ -3,7 +3,7 @@
 邏輯移植自下列腳本，條件與參數維持原腳本的實際行為：
 - standard        : PythonStock/stock_sector.py   （站上月線 + KD 金叉 + 流動性 + 爆量）
 - basic           : PythonStock/stock.py          （站上月線 + KD 金叉）
-- bottom_breakout : PythonStock/stock_sectorX.py  （均線糾結突破 + KD 低檔金叉 + MACD 翻紅 + 量能）
+- bottom_breakout : PythonStock/stock_sectorX.py  （均線糾結突破 + KD 低檔金叉 + MACD 翻紅 + 量能 + 月線大於季線）
 """
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional, Tuple
@@ -124,8 +124,25 @@ def _classify_basic(latest: pd.Series, previous: pd.Series) -> Tuple[Optional[st
     return category, conditions
 
 
+# bottom_breakout 的 7 個條件（鍵值與前端「自選條件」共用，順序即畫面顯示順序）
+BOTTOM_BREAKOUT_CONDITIONS = [
+    ("ma_tangled", "均線糾結（MA5/MA20/MA60 差距 < 5%）"),
+    ("breaking_out", "收盤突破三條均線"),
+    ("kd_low_golden_cross", "KD 低檔黃金交叉（昨日 K < 30）"),
+    ("macd_red", "MACD 柱狀翻紅（OSC > 0）"),
+    ("liquid", "5 日均量 > 500 張"),
+    ("volume_surge", "今日量 > 5 日均量 × 1.2"),
+    ("ma20_above_ma60", "月線大於季線（MA20 > MA60）"),
+]
+
+
 def _classify_bottom_breakout(latest: pd.Series, previous: pd.Series) -> Tuple[Optional[str], Dict[str, bool]]:
-    """stock_sectorX.py：抓底部起漲點。"""
+    """stock_sectorX.py：抓底部起漲點。
+
+    7 個條件全部符合才列為「底部剛突破」（strong）。
+    原腳本的「均線糾結待突破」觀察名單已改為前端自選條件，依回傳的 conditions 即時篩選，
+    因此這裡不再產生 watch 類別。
+    """
     ma_values = [latest["MA5"], latest["MA20"], latest["MA60"]]
     ma_max, ma_min = max(ma_values), min(ma_values)
     conditions = {
@@ -135,13 +152,10 @@ def _classify_bottom_breakout(latest: pd.Series, previous: pd.Series) -> Tuple[O
         "macd_red": bool(latest["OSC"] > 0),
         "liquid": bool(latest["Volume_MA5"] > MIN_AVERAGE_VOLUME_SHARES),
         "volume_surge": bool(latest["Volume"] > latest["Volume_MA5"] * VOLUME_SURGE_RATIO),
+        # 第 7 個條件：月線在季線之上，確認中期趨勢已轉多
+        "ma20_above_ma60": bool(latest["MA20"] > latest["MA60"]),
     }
-    category = None
-    if all(conditions.values()):
-        category = CATEGORY_STRONG
-    elif conditions["kd_low_golden_cross"] and conditions["ma_tangled"] and conditions["liquid"]:
-        # 均線糾結 + KD 低檔金叉，但尚未放量突破
-        category = CATEGORY_WATCH
+    category = CATEGORY_STRONG if all(conditions.values()) else None
     return category, conditions
 
 

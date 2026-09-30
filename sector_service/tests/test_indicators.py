@@ -122,15 +122,26 @@ class TestBasicStrategy:
 
 
 class TestBottomBreakoutStrategy:
-    """stock_sectorX.py：均線糾結突破 + KD 低檔金叉 + MACD 翻紅 + 量能。"""
+    """stock_sectorX.py：7 個條件（均線糾結、突破、KD 低檔金叉、MACD 翻紅、流動性、量能、月線 > 季線）。"""
 
-    def test_all_conditions_met_is_strong(self):
+    def test_all_seven_conditions_met_is_strong(self):
         frame = make_signal_frame(previous={"K": 20, "D": 25}, latest={"K": 32, "D": 28})
 
         result = evaluate_signals(frame, STRATEGY_BOTTOM_BREAKOUT)
 
         assert result.category == CATEGORY_STRONG
+        assert len(result.conditions) == 7
         assert all(result.conditions.values())
+
+    def test_ma20_below_ma60_is_not_strong(self):
+        # 其餘 6 個條件都符合，只有月線低於季線
+        frame = make_signal_frame(previous={"K": 20, "D": 25}, latest={"K": 32, "D": 28, "MA20": 94.0, "MA60": 95.0})
+
+        result = evaluate_signals(frame, STRATEGY_BOTTOM_BREAKOUT)
+
+        assert not result.conditions["ma20_above_ma60"]
+        assert sum(result.conditions.values()) == 6
+        assert result.category is None
 
     def test_golden_cross_above_30_is_not_low_golden_cross(self):
         frame = make_signal_frame(previous={"K": 40, "D": 45}, latest={"K": 55, "D": 50})
@@ -140,13 +151,18 @@ class TestBottomBreakoutStrategy:
         assert not result.conditions["kd_low_golden_cross"]
         assert result.category is None
 
-    def test_tangled_but_not_broken_out_is_watch(self):
+    def test_partial_match_has_no_server_side_watch_category(self):
+        # 原腳本的「均線糾結待突破」改由前端自選條件篩選，伺服器只回傳各條件結果
         frame = make_signal_frame(
             previous={"K": 20, "D": 25},
             latest={"K": 32, "D": 28, "Close": 95.5, "OSC": -0.1},  # 未突破 MA5、MACD 未翻紅
         )
 
-        assert evaluate_signals(frame, STRATEGY_BOTTOM_BREAKOUT).category == CATEGORY_WATCH
+        result = evaluate_signals(frame, STRATEGY_BOTTOM_BREAKOUT)
+
+        assert result.category is None
+        assert result.conditions["ma_tangled"] and result.conditions["kd_low_golden_cross"]
+        assert not result.conditions["breaking_out"] and not result.conditions["macd_red"]
 
     def test_moving_averages_far_apart_is_not_tangled(self):
         frame = make_signal_frame(previous={"K": 20, "D": 25}, latest={"K": 32, "D": 28, "MA60": 80.0})

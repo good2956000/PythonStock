@@ -87,4 +87,7 @@ dotnet run
 - 族群掃描股價改為每批 50 檔一次下載，不再每檔等 1 秒
 - 族群掃描：最近 9 日最高價等於最低價時 RSV 以 50 代替，避免最新交易日因 NaN 被刪除
 - 爆量倍數沿用程式碼實際值 1.2（`stock_sector.py` 註解寫 2 倍、`stock_sectorX.py` 註解寫 1.5 倍），定義於 `indicators.VOLUME_SURGE_RATIO`
+- 底部起漲（`stock_sectorX.py`）新增第 7 個條件「月線大於季線（MA20 > MA60）」，7 個條件全部符合才列為「底部剛突破」；
+  原本的「均線糾結待突破」觀察名單改為網頁上的「自選條件」，可任意勾選 7 個條件中的幾項即時篩選
+  （預設勾選原觀察名單的 ①均線糾結 ③KD 低檔金叉 ⑤流動性），條件定義見 `indicators.BOTTOM_BREAKOUT_CONDITIONS`
 - `market_margin.py` 檔案內接了兩個版本，採用前半段「每日 MI_MARGN」版本；後半段「每月 API」目前證交所回傳格式已無 `data` 欄位，原腳本執行時會失敗

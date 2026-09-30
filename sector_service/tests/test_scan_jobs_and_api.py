@@ -118,6 +118,17 @@ class TestApi:
 
         assert [s["strategyId"] for s in response.json()] == ["standard", "bottom_breakout", "basic"]
 
+    def test_bottom_breakout_exposes_seven_custom_conditions(self, api_client):
+        strategies = {s["strategyId"]: s for s in api_client.get("/api/strategies", headers={"X-Api-Key": API_KEY}).json()}
+        bottom = strategies["bottom_breakout"]
+
+        keys = [c["key"] for c in bottom["conditionDefinitions"]]
+        assert len(keys) == 7 and "ma20AboveMa60" in keys
+        # 預設勾選原腳本「均線糾結待突破」的三個條件，且都必須是有效的條件鍵
+        assert bottom["defaultCustomConditions"] == ["maTangled", "kdLowGoldenCross", "liquid"]
+        assert set(bottom["defaultCustomConditions"]) <= set(keys)
+        assert strategies["standard"]["conditionDefinitions"] == []
+
     def test_start_scan_with_zero_selects_all_sectors(self, api_client):
         response = api_client.post("/api/scans", json={"sectorIds": ["0"]}, headers={"X-Api-Key": API_KEY})
 
