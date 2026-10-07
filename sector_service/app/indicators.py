@@ -3,7 +3,8 @@
 邏輯移植自下列腳本，條件與參數維持原腳本的實際行為：
 - standard        : PythonStock/stock_sector.py   （站上月線 + KD 金叉 + 流動性 + 爆量）
 - basic           : PythonStock/stock.py          （站上月線 + KD 金叉）
-- bottom_breakout : PythonStock/stock_sectorX.py  （均線糾結突破 + KD 低檔金叉 + MACD 翻紅 + 量能 + 月線大於季線）
+- bottom_breakout : PythonStock/stock_sectorX.py  （均線糾結突破 + KD 低檔金叉 + MACD 翻紅 + 量能 + 月線大於季線；
+                    另提供乖離率控管、布林通道壓縮與突破等進階輔助條件）
 """
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional, Tuple
@@ -26,6 +27,18 @@ OVERHEATED_K_THRESHOLD = 80
 MA_TANGLE_RATIO = 0.05
 # bottom_breakout：昨日 K 值低於此數才算低檔金叉
 LOW_GOLDEN_CROSS_K = 30
+
+# 乖離率控管：收盤價距離月線（MA20）的乖離率需低於此值，避免追在已發動多日的高點
+MAX_BIAS_MA20 = 0.06
+
+# 布林通道（20 日、2 倍標準差）
+BOLLINGER_WINDOW = 20
+BOLLINGER_STD_MULTIPLIER = 2
+# 壓縮判斷：通道帶寬落在近 60 個交易日的最低 20% 視為壓縮（收斂）
+BOLLINGER_SQUEEZE_LOOKBACK = 60
+BOLLINGER_SQUEEZE_QUANTILE = 0.2
+# 突破當天通道會開口變寬，因此只要近 5 個交易日內曾壓縮即視為成立
+BOLLINGER_SQUEEZE_RECENT_DAYS = 5
 
 CATEGORY_STRONG = "strong"      # 強勢名單：策略的完整條件全部符合
 CATEGORY_WATCH = "watch"        # 候選觀察：符合核心條件，尚未完全確認
@@ -92,6 +105,21 @@ def add_indicators(price_frame: pd.DataFrame) -> pd.DataFrame:
 
     frame["Volume_MA5"] = frame["Volume"].rolling(window=5).mean()
 
+    # 月線乖離率（小數，0.1 = 10%）
+    frame["Bias_20"] = (close - frame["MA20"]) / frame["MA20"]
+
+    # 布林通道：中軌為 MA20，標準差採母體標準差（ddof=0，與 Bollinger 原始定義相同）
+    rolling_std = close.rolling(window=BOLLINGER_WINDOW).std(ddof=0)
+    frame["BB_Upper"] = frame["MA20"] + BOLLINGER_STD_MULTIPLIER * rolling_std
+    frame["BB_Lower"] = frame["MA20"] - BOLLINGER_STD_MULTIPLIER * rolling_std
+    frame["BB_Width"] = (frame["BB_Upper"] - frame["BB_Lower"]) / frame["MA20"]
+    # min_periods 讓資料較短（約 6 個月）時仍可判斷，且不會比 MA60 多刪除暖機資料
+    squeeze_threshold = frame["BB_Width"].rolling(
+        window=BOLLINGER_SQUEEZE_LOOKBACK, min_periods=BOLLINGER_WINDOW
+    ).quantile(BOLLINGER_SQUEEZE_QUANTILE)
+    is_squeezed = (frame["BB_Width"] <= squeeze_threshold).astype(float)
+    frame["BB_Squeeze_Recent"] = is_squeezed.rolling(window=BOLLINGER_SQUEEZE_RECENT_DAYS, min_periods=1).max() > 0
+
     return frame.dropna()
 
 
@@ -124,8 +152,8 @@ def _classify_basic(latest: pd.Series, previous: pd.Series) -> Tuple[Optional[st
     return category, conditions
 
 
-# bottom_breakout 的 7 個條件（鍵值與前端「自選條件」共用，順序即畫面顯示順序）
-BOTTOM_BREAKOUT_CONDITIONS = [
+# bottom_breakout 的 7 個核心條件：全部符合才列為「底部剛突破」
+BOTTOM_BREAKOUT_CORE_CONDITIONS = [
     ("ma_tangled", "均線糾結（MA5/MA20/MA60 差距 < 5%）"),
     ("breaking_out", "收盤突破三條均線"),
     ("kd_low_golden_cross", "KD 低檔黃金交叉（昨日 K < 30）"),
@@ -135,11 +163,21 @@ BOTTOM_BREAKOUT_CONDITIONS = [
     ("ma20_above_ma60", "月線大於季線（MA20 > MA60）"),
 ]
 
+# 進階輔助條件：僅供前端自選條件篩選，不影響「底部剛突破」名單
+BOTTOM_BREAKOUT_AUXILIARY_CONDITIONS = [
+    ("low_bias_ma20", "月線乖離率 < 6%（避免追高）"),
+    ("bollinger_squeeze", "布林通道壓縮（近 5 日帶寬落在近 60 日最低 20%）"),
+    ("bollinger_volume_breakout", "帶量突破布林上軌（收盤 > 上軌且今日量 > 5 日均量 × 1.2）"),
+]
+
+# 鍵值與前端「自選條件」共用，順序即畫面顯示順序
+BOTTOM_BREAKOUT_CONDITIONS = BOTTOM_BREAKOUT_CORE_CONDITIONS + BOTTOM_BREAKOUT_AUXILIARY_CONDITIONS
+
 
 def _classify_bottom_breakout(latest: pd.Series, previous: pd.Series) -> Tuple[Optional[str], Dict[str, bool]]:
     """stock_sectorX.py：抓底部起漲點。
 
-    7 個條件全部符合才列為「底部剛突破」（strong）。
+    7 個核心條件全部符合才列為「底部剛突破」（strong）；進階輔助條件只回傳判斷結果。
     原腳本的「均線糾結待突破」觀察名單已改為前端自選條件，依回傳的 conditions 即時篩選，
     因此這裡不再產生 watch 類別。
     """
@@ -154,8 +192,15 @@ def _classify_bottom_breakout(latest: pd.Series, previous: pd.Series) -> Tuple[O
         "volume_surge": bool(latest["Volume"] > latest["Volume_MA5"] * VOLUME_SURGE_RATIO),
         # 第 7 個條件：月線在季線之上，確認中期趨勢已轉多
         "ma20_above_ma60": bool(latest["MA20"] > latest["MA60"]),
+        # 進階輔助：乖離率控管、布林通道壓縮與帶量突破上軌
+        "low_bias_ma20": bool(latest["Bias_20"] < MAX_BIAS_MA20),
+        "bollinger_squeeze": bool(latest["BB_Squeeze_Recent"]),
+        "bollinger_volume_breakout": bool(
+            latest["Close"] > latest["BB_Upper"] and latest["Volume"] > latest["Volume_MA5"] * VOLUME_SURGE_RATIO
+        ),
     }
-    category = CATEGORY_STRONG if all(conditions.values()) else None
+    core_keys = [key for key, _ in BOTTOM_BREAKOUT_CORE_CONDITIONS]
+    category = CATEGORY_STRONG if all(conditions[key] for key in core_keys) else None
     return category, conditions
 
 

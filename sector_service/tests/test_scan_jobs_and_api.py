@@ -144,12 +144,14 @@ class TestApi:
 
         assert [s["strategyId"] for s in response.json()] == ["standard", "bottom_breakout", "basic"]
 
-    def test_bottom_breakout_exposes_seven_custom_conditions(self, api_client):
+    def test_bottom_breakout_exposes_ten_custom_conditions(self, api_client):
         strategies = {s["strategyId"]: s for s in api_client.get("/api/strategies", headers={"X-Api-Key": API_KEY}).json()}
         bottom = strategies["bottom_breakout"]
 
         keys = [c["key"] for c in bottom["conditionDefinitions"]]
-        assert len(keys) == 7 and "ma20AboveMa60" in keys
+        assert len(keys) == 10 and "ma20AboveMa60" in keys
+        # 進階輔助條件排在 7 個核心條件之後
+        assert keys[7:] == ["lowBiasMa20", "bollingerSqueeze", "bollingerVolumeBreakout"]
         # 預設勾選原腳本「均線糾結待突破」的三個條件，且都必須是有效的條件鍵
         assert bottom["defaultCustomConditions"] == ["maTangled", "kdLowGoldenCross", "liquid"]
         assert set(bottom["defaultCustomConditions"]) <= set(keys)

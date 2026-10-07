@@ -19,6 +19,7 @@ def make_signal_frame(previous, latest):
     defaults = {
         "Close": 100.0, "MA5": 96.0, "MA20": 95.0, "MA60": 94.0, "OSC": 0.5,
         "K": 50.0, "D": 50.0, "Volume": 2_000_000.0, "Volume_MA5": 1_000_000.0,
+        "Bias_20": 0.05, "BB_Upper": 99.0, "BB_Squeeze_Recent": True,
     }
     rows = [{**defaults, **previous}, {**defaults, **latest}]
     return pd.DataFrame(rows, index=pd.to_datetime(["2026-09-28", "2026-09-29"]))
@@ -48,6 +49,39 @@ class TestAddIndicators:
 
         assert frame.index[-1] == prices.index[-1]
         assert frame["RSV"].iloc[-1] == pytest.approx(50)
+
+
+class TestBollingerAndBias:
+    def test_bollinger_bands_match_manual_calculation(self, price_frame_factory):
+        closes = [100.0 + (i % 7) * 1.5 for i in range(80)]
+        frame = add_indicators(price_frame_factory(closes))
+
+        window = pd.Series(closes[-20:])
+        middle = window.mean()
+        std = window.std(ddof=0)
+        assert frame["BB_Upper"].iloc[-1] == pytest.approx(middle + 2 * std)
+        assert frame["BB_Lower"].iloc[-1] == pytest.approx(middle - 2 * std)
+        assert frame["BB_Width"].iloc[-1] == pytest.approx(4 * std / middle)
+
+    def test_bias_20_is_distance_from_ma20(self, price_frame_factory):
+        frame = add_indicators(price_frame_factory(range(1, 81)))
+
+        ma20 = sum(range(61, 81)) / 20
+        assert frame["Bias_20"].iloc[-1] == pytest.approx((80 - ma20) / ma20)
+
+    def test_narrowing_band_after_volatile_period_is_squeeze(self, price_frame_factory):
+        # 前段大幅震盪、最後 25 日幾乎不動 → 帶寬落在近 60 日最低區間
+        closes = [100.0 + (8 if i % 2 else -8) for i in range(75)] + [100.0 + (i % 2) * 0.2 for i in range(25)]
+        frame = add_indicators(price_frame_factory(closes))
+
+        assert bool(frame["BB_Squeeze_Recent"].iloc[-1])
+
+    def test_widening_band_is_not_squeeze(self, price_frame_factory):
+        # 前段平穩、最後 25 日大幅震盪 → 帶寬為近 60 日最寬，不屬於壓縮
+        closes = [100.0 + (i % 2) * 0.2 for i in range(75)] + [100.0 + (8 if i % 2 else -8) for i in range(25)]
+        frame = add_indicators(price_frame_factory(closes))
+
+        assert not bool(frame["BB_Squeeze_Recent"].iloc[-1])
 
 
 class TestEvaluateSignals:
@@ -122,15 +156,16 @@ class TestBasicStrategy:
 
 
 class TestBottomBreakoutStrategy:
-    """stock_sectorX.py：7 個條件（均線糾結、突破、KD 低檔金叉、MACD 翻紅、流動性、量能、月線 > 季線）。"""
+    """stock_sectorX.py：7 個核心條件（均線糾結、突破、KD 低檔金叉、MACD 翻紅、流動性、量能、月線 > 季線）
+    加上 3 個進階輔助條件（乖離率控管、布林通道壓縮、帶量突破布林上軌）。"""
 
-    def test_all_seven_conditions_met_is_strong(self):
+    def test_all_ten_conditions_met_is_strong(self):
         frame = make_signal_frame(previous={"K": 20, "D": 25}, latest={"K": 32, "D": 28})
 
         result = evaluate_signals(frame, STRATEGY_BOTTOM_BREAKOUT)
 
         assert result.category == CATEGORY_STRONG
-        assert len(result.conditions) == 7
+        assert len(result.conditions) == 10
         assert all(result.conditions.values())
 
     def test_ma20_below_ma60_is_not_strong(self):
@@ -140,7 +175,7 @@ class TestBottomBreakoutStrategy:
         result = evaluate_signals(frame, STRATEGY_BOTTOM_BREAKOUT)
 
         assert not result.conditions["ma20_above_ma60"]
-        assert sum(result.conditions.values()) == 6
+        assert sum(result.conditions.values()) == 9
         assert result.category is None
 
     def test_golden_cross_above_30_is_not_low_golden_cross(self):
@@ -171,6 +206,45 @@ class TestBottomBreakoutStrategy:
 
         assert not result.conditions["ma_tangled"]
         assert result.category is None
+
+    def test_auxiliary_conditions_do_not_affect_strong_category(self):
+        # 進階輔助條件全部不符合，但 7 個核心條件都符合，仍列為底部剛突破
+        frame = make_signal_frame(
+            previous={"K": 20, "D": 25},
+            latest={"K": 32, "D": 28, "Bias_20": 0.15, "BB_Upper": 105.0, "BB_Squeeze_Recent": False},
+        )
+
+        result = evaluate_signals(frame, STRATEGY_BOTTOM_BREAKOUT)
+
+        assert result.category == CATEGORY_STRONG
+        assert not result.conditions["low_bias_ma20"]
+        assert not result.conditions["bollinger_squeeze"]
+        assert not result.conditions["bollinger_volume_breakout"]
+
+    @pytest.mark.parametrize("bias, expected", [(0.0599, True), (0.06, False), (0.10, False)])
+    def test_low_bias_ma20_requires_bias_below_six_percent(self, bias, expected):
+        frame = make_signal_frame(previous={"K": 20, "D": 25}, latest={"K": 32, "D": 28, "Bias_20": bias})
+
+        result = evaluate_signals(frame, STRATEGY_BOTTOM_BREAKOUT)
+
+        assert result.conditions["low_bias_ma20"] is expected
+
+    def test_close_above_upper_band_without_volume_is_not_breakout(self):
+        frame = make_signal_frame(
+            previous={"K": 20, "D": 25},
+            latest={"K": 32, "D": 28, "Volume": 1_100_000.0},  # 量 < 5 日均量 × 1.2
+        )
+
+        result = evaluate_signals(frame, STRATEGY_BOTTOM_BREAKOUT)
+
+        assert not result.conditions["bollinger_volume_breakout"]
+
+    def test_close_below_upper_band_is_not_breakout(self):
+        frame = make_signal_frame(previous={"K": 20, "D": 25}, latest={"K": 32, "D": 28, "BB_Upper": 100.5})
+
+        result = evaluate_signals(frame, STRATEGY_BOTTOM_BREAKOUT)
+
+        assert not result.conditions["bollinger_volume_breakout"]
 
     def test_unknown_strategy_raises(self):
         frame = make_signal_frame(previous={}, latest={})
