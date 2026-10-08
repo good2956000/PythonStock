@@ -10,8 +10,6 @@ import hmac
 import logging
 import os
 import re
-import threading
-import time
 from contextlib import asynccontextmanager
 from datetime import date
 from functools import partial
@@ -24,11 +22,19 @@ from pydantic.alias_generators import to_camel
 from . import market_analysis, market_data, signal_analysis
 from .indicators import BOTTOM_BREAKOUT_CONDITIONS, STRATEGY_CLASSIFIERS, STRATEGY_STANDARD, add_indicators
 from .scan_jobs import ScanJobManager
+from .sector_cache import SectorCache
+
+# 讓本服務各模組的 INFO 以上訊息輸出到 stderr（部署時導向 logs/service.log）
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 logger = logging.getLogger(__name__)
 
 API_KEY_ENV_NAME = "SECTOR_API_KEY"
 SECTOR_CACHE_SECONDS = int(os.getenv("SECTOR_CACHE_SECONDS", str(12 * 60 * 60)))
+# 族群清單硬碟快取（服務重新啟動後立即可用）；預設放在 app 資料夾旁的 cache/
+SECTOR_CACHE_FILE = os.getenv(
+    "SECTOR_CACHE_FILE", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache", "sectors.json")
+)
 DOWNLOAD_CHUNK_DELAY_SECONDS = float(os.getenv("DOWNLOAD_CHUNK_DELAY_SECONDS", "1"))
 TICKER_PATTERN = re.compile(r"^\d{4}\.(TW|TWO)$")
 # 個股分析接受純數字台股代號（自動判斷上市 / 上櫃）、含後綴的台股代號或美股代號
@@ -112,26 +118,7 @@ STRATEGIES = [
 assert {s.strategy_id for s in STRATEGIES} == set(STRATEGY_CLASSIFIERS)
 
 
-class SectorCache:
-    """產業清單快取；證交所清單一天內變動極少，不需要每次掃描都重新抓取。"""
-
-    def __init__(self, ttl_seconds: int):
-        self._ttl_seconds = ttl_seconds
-        self._sectors: List[market_data.Sector] = []
-        self._loaded_at = 0.0
-        self._lock = threading.Lock()
-
-    def get(self) -> List[market_data.Sector]:
-        with self._lock:
-            if not self._sectors or time.monotonic() - self._loaded_at > self._ttl_seconds:
-                sectors = market_data.fetch_sectors()
-                if sectors:
-                    self._sectors = sectors
-                    self._loaded_at = time.monotonic()
-            return self._sectors
-
-
-sector_cache = SectorCache(SECTOR_CACHE_SECONDS)
+sector_cache = SectorCache(SECTOR_CACHE_SECONDS, market_data.fetch_sectors, SECTOR_CACHE_FILE)
 job_manager = ScanJobManager(
     price_downloader=partial(market_data.download_price_history, chunk_delay_seconds=DOWNLOAD_CHUNK_DELAY_SECONDS)
 )
@@ -141,6 +128,8 @@ job_manager = ScanJobManager(
 async def lifespan(_: FastAPI):
     if not os.getenv(API_KEY_ENV_NAME):
         logger.warning("未設定環境變數 %s，所有 API 請求都會被拒絕", API_KEY_ENV_NAME)
+    # 先載入硬碟快取並在背景更新，避免第一位使用者等待證交所下載
+    sector_cache.warm_up()
     yield
     job_manager.shutdown()
 

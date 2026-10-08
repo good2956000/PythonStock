@@ -47,22 +47,41 @@ def build_stock_name_map(sectors: List[Sector]) -> Dict[str, str]:
     return names
 
 
-def fetch_sectors(timeout_seconds: int = 15) -> List[Sector]:
+def download_text_with_deadline(url: str, encoding: str, read_timeout_seconds: int, total_timeout_seconds: int) -> str:
+    """下載網頁文字，並限制「總下載時間」。
+
+    requests 的 timeout 只限制連線與「兩段資料之間」的等待時間，
+    伺服器以極慢速度持續傳送時不會逾時（證交所 ISIN 頁面約 9 MB，曾觀察到超過 30 秒），
+    因此以串流方式讀取並自行檢查總時間，超過即中止。
+    """
+    deadline = time.monotonic() + total_timeout_seconds
+    chunks = []
+    with requests.get(url, headers=REQUEST_HEADERS, timeout=read_timeout_seconds, stream=True) as response:
+        response.raise_for_status()
+        for chunk in response.iter_content(chunk_size=256 * 1024):
+            chunks.append(chunk)
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"Download exceeded {total_timeout_seconds}s: {url}")
+    # 與 requests 的 response.text 相同，無法解碼的位元組以替代字元處理
+    return b"".join(chunks).decode(encoding, errors="replace")
+
+
+def fetch_sectors(read_timeout_seconds: int = 15, total_timeout_seconds: int = 90) -> List[Sector]:
     """從證交所 ISIN 頁面抓取上市、上櫃普通股並依產業別分組。
 
     上市與上櫃中同名的產業會合併為同一族群（與原腳本行為一致）。
+    任一市場抓取失敗即回傳空清單，避免把不完整的清單當成有效資料快取起來。
     """
     sectors_by_name: Dict[str, Sector] = {}
 
     for suffix, mode in MARKET_TARGETS:
         url = ISIN_URL_TEMPLATE.format(mode=mode)
         try:
-            response = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout_seconds)
-            response.encoding = "big5"
-            frame = pd.read_html(StringIO(response.text))[0]
+            html = download_text_with_deadline(url, "big5", read_timeout_seconds, total_timeout_seconds)
+            frame = pd.read_html(StringIO(html))[0]
         except Exception:
-            logger.exception("抓取 %s 股票清單失敗", suffix)
-            continue
+            logger.exception("抓取 %s 股票清單失敗，本次不更新族群清單", suffix)
+            return []
 
         frame.columns = frame.iloc[0]
         frame = frame.iloc[2:]
