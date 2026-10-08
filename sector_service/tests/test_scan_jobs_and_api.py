@@ -152,8 +152,8 @@ class TestApi:
         assert len(keys) == 10 and "ma20AboveMa60" in keys
         # 進階輔助條件排在 7 個核心條件之後
         assert keys[7:] == ["lowBiasMa20", "bollingerSqueeze", "bollingerVolumeBreakout"]
-        # 預設勾選原腳本「均線糾結待突破」的三個條件，且都必須是有效的條件鍵
-        assert bottom["defaultCustomConditions"] == ["maTangled", "kdLowGoldenCross", "liquid"]
+        # 預設勾選 ⑤ 流動性 ⑦ 月線大於季線 ⑧ 月線乖離率 < 6%，且都必須是有效的條件鍵
+        assert bottom["defaultCustomConditions"] == ["liquid", "ma20AboveMa60", "lowBiasMa20"]
         assert set(bottom["defaultCustomConditions"]) <= set(keys)
         assert strategies["standard"]["conditionDefinitions"] == []
 

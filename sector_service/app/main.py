@@ -105,8 +105,8 @@ STRATEGIES = [
                     "7 個條件全部符合列為底部剛突破；自選條件可任意勾選其中幾項即時篩選。"
                     "自選條件另提供進階輔助：⑧ 月線乖離率 < 6% ⑨ 布林通道壓縮 ⑩ 帶量突破布林上軌（不影響底部剛突破名單）。",
         condition_definitions=[ConditionDefinition(key=to_camel(key), label=label) for key, label in BOTTOM_BREAKOUT_CONDITIONS],
-        # 預設勾選原腳本「均線糾結待突破」的條件：① 均線糾結 ③ KD 低檔金叉 ⑤ 流動性
-        default_custom_conditions=[to_camel(key) for key in ("ma_tangled", "kd_low_golden_cross", "liquid")],
+        # 預設勾選：⑤ 流動性（5 日均量 > 500 張） ⑦ 月線大於季線 ⑧ 月線乖離率 < 6%
+        default_custom_conditions=[to_camel(key) for key in ("liquid", "ma20_above_ma60", "low_bias_ma20")],
     ),
     StrategySummary(
         strategy_id="basic", name="月線 + KD 金叉", source_script="stock.py",
