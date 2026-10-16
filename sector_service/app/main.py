@@ -10,8 +10,9 @@ import hmac
 import logging
 import os
 import re
+import threading
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, timedelta
 from functools import partial
 from typing import List, Optional
 
@@ -19,7 +20,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
-from . import market_analysis, market_data, signal_analysis
+from . import economic_calendar, market_analysis, market_data, signal_analysis
+from .fred_client import FredApiError, FredClient
 from .indicators import BOTTOM_BREAKOUT_CONDITIONS, STRATEGY_CLASSIFIERS, STRATEGY_STANDARD, add_indicators
 from .scan_jobs import ScanJobManager
 from .sector_cache import SectorCache
@@ -30,6 +32,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger(__name__)
 
 API_KEY_ENV_NAME = "SECTOR_API_KEY"
+# FRED API 金鑰（全球日曆使用）；未設定時日曆 API 回傳 503
+FRED_API_KEY_ENV_NAME = "FRED_API_KEY"
+CALENDAR_MAX_DAYS = 92
+# 背景預熱 FRED 快取的間隔（需小於 FredClient 的 1 小時快取，讓使用者幾乎都命中快取）
+CALENDAR_WARM_UP_INTERVAL_SECONDS = int(os.getenv("CALENDAR_WARM_UP_INTERVAL_SECONDS", str(50 * 60)))
+_calendar_warm_up_stop = threading.Event()
 SECTOR_CACHE_SECONDS = int(os.getenv("SECTOR_CACHE_SECONDS", str(12 * 60 * 60)))
 # 族群清單硬碟快取（服務重新啟動後立即可用）；預設放在 app 資料夾旁的 cache/
 SECTOR_CACHE_FILE = os.getenv(
@@ -130,7 +138,9 @@ async def lifespan(_: FastAPI):
         logger.warning("未設定環境變數 %s，所有 API 請求都會被拒絕", API_KEY_ENV_NAME)
     # 先載入硬碟快取並在背景更新，避免第一位使用者等待證交所下載
     sector_cache.warm_up()
+    threading.Thread(target=_warm_up_calendar_loop, name="calendar-warm-up", daemon=True).start()
     yield
+    _calendar_warm_up_stop.set()
     job_manager.shutdown()
 
 
@@ -300,6 +310,86 @@ def get_margin(days: int = Query(default=60, ge=10, le=120)) -> dict:
     if not records:
         raise HTTPException(status_code=502, detail="Unable to download margin data from TWSE")
     return market_analysis.analyze_margin(index_frame, records)
+
+
+# ---------------------------------------------------------------------------
+# 全球經濟日曆（FRED）
+# ---------------------------------------------------------------------------
+_fred_client: Optional[FredClient] = None
+_fred_client_key: Optional[str] = None
+
+
+def get_fred_client() -> FredClient:
+    """依環境變數建立 FRED 用戶端；金鑰變更時重建（快取隨之清空）。"""
+    global _fred_client, _fred_client_key
+    api_key = os.getenv(FRED_API_KEY_ENV_NAME, "")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="FRED API key is not configured")
+    if _fred_client is None or _fred_client_key != api_key:
+        _fred_client, _fred_client_key = FredClient(api_key), api_key
+    return _fred_client
+
+
+def _warm_up_calendar_once() -> None:
+    """預先載入本月起三個月的日曆、重要指標最新值與政策利率（與頁面預設查詢的範圍相同）。"""
+    if not os.getenv(FRED_API_KEY_ENV_NAME):
+        return
+    client = get_fred_client()
+    today = date.today()
+    month_start = today.replace(day=1)
+    for offset in range(3):
+        start = (month_start + timedelta(days=32 * offset)).replace(day=1)
+        end = (start + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        calendar = economic_calendar.build_calendar(client, start, end)
+        release_ids = [event["releaseId"] for event in calendar["events"] if event["hasIndicators"]]
+        economic_calendar.get_release_indicators(client, release_ids)
+    economic_calendar.get_policy_rates(client)
+
+
+def _warm_up_calendar_loop() -> None:
+    while not _calendar_warm_up_stop.is_set():
+        try:
+            _warm_up_calendar_once()
+        except Exception as error:   # 背景預熱失敗不影響服務，下一輪再試；使用者請求時仍會即時查詢
+            # 只記錄類型與已去除金鑰的 FredApiError 訊息
+            detail = str(error) if isinstance(error, FredApiError) else type(error).__name__
+            logger.warning("全球日曆背景預熱失敗：%s", detail)
+        _calendar_warm_up_stop.wait(CALENDAR_WARM_UP_INTERVAL_SECONDS)
+
+
+@app.get("/api/calendar", dependencies=[Depends(verify_api_key)])
+def get_calendar(
+    start_date: date = Query(alias="startDate"),
+    end_date: date = Query(alias="endDate"),
+    scope: str = Query(default=economic_calendar.SCOPE_IMPORTANT),
+) -> dict:
+    """經濟數據發布日程（含未來排程）與重要指標的最新值。"""
+    if scope not in (economic_calendar.SCOPE_IMPORTANT, economic_calendar.SCOPE_ALL):
+        raise HTTPException(status_code=400, detail="scope must be important or all")
+    if end_date < start_date or (end_date - start_date).days > CALENDAR_MAX_DAYS:
+        raise HTTPException(status_code=400, detail=f"Date range must be 0-{CALENDAR_MAX_DAYS} days")
+    try:
+        return economic_calendar.build_calendar(get_fred_client(), start_date, end_date, scope)
+    except FredApiError as error:
+        raise HTTPException(status_code=502, detail=str(error))
+
+
+@app.get("/api/calendar/indicators", dependencies=[Depends(verify_api_key)])
+def get_calendar_indicators(release_ids: str = Query(alias="releaseIds", max_length=200)) -> dict:
+    """重要指標 release 的最新值 / 前值，releaseIds 以逗號分隔（例如 10,50,53）。"""
+    if not re.fullmatch(r"\d{1,5}(,\d{1,5}){0,49}", release_ids):
+        raise HTTPException(status_code=400, detail="releaseIds must be comma separated numbers")
+    ids = [int(value) for value in release_ids.split(",")]
+    return {"indicators": economic_calendar.get_release_indicators(get_fred_client(), ids)}
+
+
+@app.get("/api/calendar/policy-rates", dependencies=[Depends(verify_api_key)])
+def get_policy_rates() -> dict:
+    """美國聯準會與歐洲央行目前政策利率（含上次調整日期）。"""
+    try:
+        return {"rates": economic_calendar.get_policy_rates(get_fred_client())}
+    except FredApiError as error:
+        raise HTTPException(status_code=502, detail=str(error))
 
 
 def to_camel_keys(value):

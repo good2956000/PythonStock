@@ -13,6 +13,7 @@
 | `stock_all.py` | 大盤 KD 波段回測 0050 | `GET /api/market/kd-backtest` |
 | `market_rebound.py` | 回檔後隔月反彈統計 | `GET /api/market/rebound` |
 | `market_margin.py` | 融資餘額與維持率 | `GET /api/market/margin` |
+| （新功能，非原腳本） | 全球日曆 | `GET /api/calendar`、`/api/calendar/indicators`、`/api/calendar/policy-rates` |
 
 原腳本保留不動，仍可在命令列單獨執行。
 
@@ -26,6 +27,8 @@
 | `app/serialization.py` | Domain | pandas / numpy 結果轉 JSON（NaN → null） |
 | `app/market_data.py` | Infrastructure | 證交所產業清單與融資資料、Yahoo Finance 日 K 下載與快取 |
 | `app/scan_jobs.py` | Application | 背景掃描工作（單一執行緒依序處理） |
+| `app/economic_calendar.py` | Domain | 全球日曆：重要指標清單（中文名稱、重要性）、最新值、政策利率 |
+| `app/fred_client.py` | Infrastructure | FRED API 用戶端（快取、重試、失敗時沿用舊資料，錯誤訊息不含金鑰） |
 | `app/main.py` | Presentation | FastAPI 端點、輸入驗證與 API Key 驗證 |
 
 ## 安裝與啟動（開發環境）
@@ -68,6 +71,18 @@ dotnet run
 | GET | `/api/market/kd-backtest` | `startDate`=YYYY-MM-DD（預設 2020-06-01） | |
 | GET | `/api/market/rebound` | `period`=2y/5y/10y/max（預設 5y） | |
 | GET | `/api/market/margin` | `days`=10~120（預設 60） | 首次約 30~40 秒，已公布日期會快取 |
+| GET | `/api/calendar` | `startDate`、`endDate`（最多 92 天）、`scope`=important/all | FRED 發布日程（含未來排程） |
+| GET | `/api/calendar/indicators` | `releaseIds`=10,50,…（最多 50 個） | 重要指標的最新值 / 前值（平行查詢） |
+| GET | `/api/calendar/policy-rates` | | 聯準會、歐洲央行目前利率與上次調整日期 |
+
+### 全球日曆（FRED）
+
+- 需要環境變數 `FRED_API_KEY`（未設定時日曆 API 回傳 503）；**金鑰不得寫入程式碼或設定檔**。
+  部署時由 `deploy/Deploy-SectorScan.ps1` 詢問並存於受保護的 `secrets/fred_api_key.txt`，更換時加 `-ResetFredApiKey`
+- 資料限制：FRED 以美國數據為主（國際僅歐元區、日本、OECD 部分項目，無台灣 / 中國）；只有日期、沒有發布時間；
+  FOMC（101）與 ECB 利率（484）在 FRED 中每天都有日期，並非會議日程，因此不列入日曆，改以政策利率呈現
+- 服務啟動後每 50 分鐘於背景預先載入本月起三個月的日曆與指標（`CALENDAR_WARM_UP_INTERVAL_SECONDS`），
+  FRED 單次請求逾時或 5xx 會重試一次，仍失敗時沿用 24 小時內的舊資料
 
 ## 快取與限流
 
