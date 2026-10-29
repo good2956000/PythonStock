@@ -22,6 +22,7 @@ from pydantic.alias_generators import to_camel
 
 from . import economic_calendar, market_analysis, market_data, signal_analysis
 from .fred_client import FredApiError, FredClient
+from .mops_news import MopsApiError, MopsClient, one_month_before
 from .indicators import BOTTOM_BREAKOUT_CONDITIONS, STRATEGY_CLASSIFIERS, STRATEGY_STANDARD, add_indicators
 from .scan_jobs import ScanJobManager
 from .sector_cache import SectorCache
@@ -390,6 +391,42 @@ def get_policy_rates() -> dict:
         return {"rates": economic_calendar.get_policy_rates(get_fred_client())}
     except FredApiError as error:
         raise HTTPException(status_code=502, detail=str(error))
+
+
+# ---------------------------------------------------------------------------
+# 近期發布之重大訊息（公開資訊觀測站）
+# ---------------------------------------------------------------------------
+MOPS_MAX_COMPANIES = 10
+mops_client = MopsClient()
+
+
+def _raise_for_mops_error(error: MopsApiError):
+    # 查詢條件錯誤（例如公司代號不存在）回 404，MOPS 本身無法連線回 502
+    raise HTTPException(status_code=404 if error.is_client_error else 502, detail=str(error))
+
+
+@app.get("/api/mops/news", dependencies=[Depends(verify_api_key)])
+def get_material_news(company_ids: str = Query(alias="companyIds", max_length=80)) -> dict:
+    """多家公司近一個月內的重大訊息（MOPS 每家最多提供最近 10 筆），companyIds 以逗號分隔（最多 10 家）；
+    個別公司查詢失敗列於 errors。"""
+    ids = [value.strip().upper() for value in company_ids.split(",") if value.strip()]
+    if not ids or len(ids) > MOPS_MAX_COMPANIES or not all(re.fullmatch(r"[0-9A-Z]{4,6}", i) for i in ids):
+        raise HTTPException(status_code=400, detail=f"companyIds must be 1-{MOPS_MAX_COMPANIES} stock codes")
+    return mops_client.get_news_for_companies(ids, since=one_month_before(date.today()))
+
+
+@app.get("/api/mops/news/detail", dependencies=[Depends(verify_api_key)])
+def get_material_news_detail(
+    company_id: str = Query(alias="companyId", pattern=r"^[0-9A-Z]{4,6}$"),
+    market_kind: str = Query(alias="marketKind", pattern=r"^[a-z]{2,5}$"),
+    enter_date: str = Query(alias="enterDate", pattern=r"^\d{7}$"),
+    serial_number: str = Query(alias="serialNumber", pattern=r"^\d{1,3}$"),
+) -> dict:
+    """單則重大訊息完整內容（不含發言人姓名與電話）。"""
+    try:
+        return mops_client.get_news_detail(company_id, market_kind, enter_date, serial_number)
+    except MopsApiError as error:
+        _raise_for_mops_error(error)
 
 
 def to_camel_keys(value):
