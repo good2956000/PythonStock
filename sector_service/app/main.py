@@ -12,7 +12,7 @@ import os
 import re
 import threading
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import partial
 from typing import List, Optional
 
@@ -55,6 +55,7 @@ SECTOR_ID_PATTERN = r"^[A-Z]?\d{1,4}$"
 
 SIGNAL_ANALYSIS_PERIODS = {"3mo", "6mo", "1y", "2y", "5y"}
 REBOUND_PERIODS = {"2y", "5y", "10y", "max"}
+TAIPEI_TIMEZONE = timezone(timedelta(hours=8))   # 台灣無日光節約時間，固定 UTC+8
 INDEX_TICKER = "^TWII"
 ETF_TICKER = "0050.TW"
 
@@ -296,6 +297,7 @@ def get_rebound(period: str = Query(default="5y")) -> dict:
     index_frame = market_data.download_single_history(INDEX_TICKER, period=period)
     if index_frame is None:
         raise HTTPException(status_code=502, detail="Unable to download index data")
+    index_frame = market_analysis.drop_unclosed_session(index_frame, datetime.now(TAIPEI_TIMEZONE))
     return {"period": period, **market_analysis.analyze_rebound(index_frame)}
 
 

@@ -4,6 +4,7 @@
 - analyze_rebound      : 移植自 PythonStock/market_rebound.py （大盤回檔後隔月反彈統計）
 - analyze_margin       : 移植自 PythonStock/market_margin.py  （融資餘額 + 近似融資維持率）
 """
+from datetime import datetime, time
 from typing import Dict, List
 
 import numpy as np
@@ -122,6 +123,16 @@ def run_kd_band_backtest(twii: pd.DataFrame, etf: pd.DataFrame) -> Dict:
 MONTH_TRADING_DAYS = 21                                    # 約一個月交易日
 REBOUND_BINS = [-np.inf, -9, -8, -7, -6, -5, -4, -3]       # 只看單日跌 3% 以上
 STRONG_UP_RATE = 55                                        # 隔月上漲率 > 55% 特別標示
+MARKET_CLOSE_TIME = time(13, 30)                           # 台股收盤時間（台北時間）
+
+
+def drop_unclosed_session(frame: pd.DataFrame, taipei_now: datetime) -> pd.DataFrame:
+    """盤中（台北時間 13:30 前）Yahoo 會回傳當日即時價，尚非收盤價，先排除，只統計到最新收盤日。"""
+    if frame.empty or taipei_now.time() >= MARKET_CLOSE_TIME:
+        return frame
+    if frame.index[-1].date() == taipei_now.date():
+        return frame.iloc[:-1]
+    return frame
 
 
 def _bin_labels() -> List[str]:
@@ -132,11 +143,17 @@ def _bin_labels() -> List[str]:
 
 
 def analyze_rebound(index_frame: pd.DataFrame) -> Dict:
-    """統計大盤單日下跌各區間之後，約一個月（21 個交易日）的表現。"""
+    """統計大盤單日下跌各區間之後，約一個月（21 個交易日）的表現。
+
+    資料保留到最新收盤日；最近未滿 21 個交易日的回檔日，隔月漲跌尚未產生（回傳 None），
+    列在明細與 pendingCount，但不納入上漲率與平均值的計算。
+    """
     frame = index_frame[["Close"]].copy()
     frame["Return_T"] = frame["Close"].pct_change() * 100
     frame["Return_T1"] = frame["Close"].pct_change(periods=MONTH_TRADING_DAYS).shift(-MONTH_TRADING_DAYS) * 100
-    frame = frame.dropna()
+    # 只去掉第一列（沒有前一日可比較）；隔月報酬為 NaN 的最近一個月要保留
+    frame = frame.dropna(subset=["Return_T"])
+    settled_frame = frame.dropna(subset=["Return_T1"])
 
     labels = _bin_labels()
     declines = frame[frame["Return_T"] < 0].copy()
@@ -148,17 +165,19 @@ def analyze_rebound(index_frame: pd.DataFrame) -> Dict:
         group = declines[declines["Bin"] == label]
         if group.empty:
             continue
-        up_count = int((group["Return_T1"] > 0).sum())
-        up_rate = up_count / len(group) * 100
+        settled = group.dropna(subset=["Return_T1"])
+        up_count = int((settled["Return_T1"] > 0).sum())
+        up_rate = up_count / len(settled) * 100 if len(settled) else None
         buckets.append({
             "range": label,
-            "sampleCount": len(group),
+            "sampleCount": len(settled),               # 已有隔月結果的樣本數（上漲率的分母）
+            "pendingCount": len(group) - len(settled), # 未滿 21 個交易日、尚無隔月結果
             "upCount": up_count,
             "upRate": to_float(up_rate, 1),
-            "averageNextMonth": to_float(group["Return_T1"].mean(), 2),
-            "medianNextMonth": to_float(group["Return_T1"].median(), 2),
+            "averageNextMonth": to_float(settled["Return_T1"].mean(), 2),
+            "medianNextMonth": to_float(settled["Return_T1"].median(), 2),
             "averageDecline": to_float(group["Return_T"].mean(), 2),
-            "isStrong": bool(round(up_rate, 1) > STRONG_UP_RATE),
+            "isStrong": up_rate is not None and bool(round(up_rate, 1) > STRONG_UP_RATE),
         })
 
     details = declines[declines["Return_T"] <= -3].sort_index()
@@ -168,17 +187,22 @@ def analyze_rebound(index_frame: pd.DataFrame) -> Dict:
         "dailyReturn": to_float(row["Return_T"], 2),
         "nextMonthReturn": to_float(row["Return_T1"], 2),
     } for date, row in details.iterrows()]
-    detail_up_count = int((details["Return_T1"] > 0).sum())
+    settled_details = details.dropna(subset=["Return_T1"])
+    detail_up_count = int((settled_details["Return_T1"] > 0).sum())
 
     return {
         "startDate": frame.index[0].strftime("%Y-%m-%d"),
         "endDate": frame.index[-1].strftime("%Y-%m-%d"),
+        "latestClose": to_float(frame["Close"].iloc[-1], 2),
+        # 最後一個已有隔月結果的交易日；之後的日期隔月漲跌尚未產生
+        "settledEndDate": settled_frame.index[-1].strftime("%Y-%m-%d") if len(settled_frame) else None,
         "tradingDays": len(frame),
         "monthTradingDays": MONTH_TRADING_DAYS,
         "buckets": buckets,
         "details": detail_rows,
         "detailUpCount": detail_up_count,
-        "detailDownCount": len(detail_rows) - detail_up_count,
+        "detailDownCount": len(settled_details) - detail_up_count,
+        "detailPendingCount": len(details) - len(settled_details),
     }
 
 

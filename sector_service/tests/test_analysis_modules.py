@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -100,6 +101,51 @@ class TestRebound:
         assert bucket["sampleCount"] == 1
         assert bucket["upCount"] == 1        # 95 → 21 個交易日後 96，上漲
         assert result["details"][0]["dailyReturn"] == pytest.approx(-5.0)
+
+    def test_keeps_latest_close_and_marks_pending_next_month(self):
+        closes = [100.0] * 40
+        closes[5] = 95.0            # 單日 -5%，21 個交易日後已有結果
+        for i in range(6, 40):
+            closes[i] = 96.0
+        closes[35] = 90.0           # 單日 -6.25%，距最新收盤不足 21 個交易日
+        for i in range(36, 40):
+            closes[i] = 91.0
+        index = pd.bdate_range("2026-01-01", periods=len(closes))
+        frame = pd.DataFrame({"Close": closes}, index=index)
+
+        result = market_analysis.analyze_rebound(frame)
+
+        # 結束日期為最新收盤日，不再少掉最近 21 個交易日
+        assert result["endDate"] == index[-1].strftime("%Y-%m-%d")
+        assert result["latestClose"] == pytest.approx(91.0)
+        assert result["settledEndDate"] == index[-1 - 21].strftime("%Y-%m-%d")
+        assert result["tradingDays"] == len(closes) - 1
+
+        pending_bucket = next(b for b in result["buckets"] if b["range"] == "-7.0% ~ -6.0%")
+        assert (pending_bucket["sampleCount"], pending_bucket["pendingCount"]) == (0, 1)
+        assert pending_bucket["upRate"] is None
+        assert pending_bucket["averageNextMonth"] is None
+        assert pending_bucket["isStrong"] is False
+        assert pending_bucket["averageDecline"] == pytest.approx(-6.25)
+
+        settled_bucket = next(b for b in result["buckets"] if b["range"] == "-6.0% ~ -5.0%")
+        assert (settled_bucket["sampleCount"], settled_bucket["pendingCount"], settled_bucket["upRate"]) == (1, 0, 100.0)
+
+        assert [row["nextMonthReturn"] is None for row in result["details"]] == [False, True]
+        assert (result["detailUpCount"], result["detailDownCount"], result["detailPendingCount"]) == (1, 0, 1)
+
+    @pytest.mark.parametrize("now, expected_last", [
+        (datetime(2026, 11, 5, 10, 0), "2026-11-04"),    # 盤中：當日即時價排除
+        (datetime(2026, 11, 5, 13, 30), "2026-11-05"),   # 已收盤：保留當日
+        (datetime(2026, 11, 6, 9, 30), "2026-11-05"),    # 隔日盤中、尚無當日資料：不影響前一日收盤
+    ])
+    def test_drop_unclosed_session(self, now, expected_last):
+        index = pd.bdate_range("2026-11-02", "2026-11-05")
+        frame = pd.DataFrame({"Close": [100.0, 101.0, 102.0, 103.0]}, index=index)
+
+        result = market_analysis.drop_unclosed_session(frame, now)
+
+        assert result.index[-1].strftime("%Y-%m-%d") == expected_last
 
 
 class TestMargin:
