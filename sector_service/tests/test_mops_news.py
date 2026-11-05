@@ -203,7 +203,7 @@ def api_client(monkeypatch):
 
 
 class TestMopsApi:
-    @pytest.mark.parametrize("ids", ["", "2330;1", ",".join(["2330"] * 11), "../etc"])
+    @pytest.mark.parametrize("ids", ["", "2330;1", ",".join(["2330"] * 31), "../etc"])
     def test_invalid_company_ids_are_rejected(self, api_client, ids):
         assert api_client.get(f"/api/mops/news?companyIds={ids}", headers=HEADERS).status_code in (400, 422)
 

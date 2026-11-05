@@ -398,7 +398,7 @@ def get_policy_rates() -> dict:
 # ---------------------------------------------------------------------------
 # 近期發布之重大訊息（公開資訊觀測站）
 # ---------------------------------------------------------------------------
-MOPS_MAX_COMPANIES = 10
+MOPS_MAX_COMPANIES = 30  # 與 .NET MaterialNewsOptions.MaxCompanies 一致；逐家查詢、間隔 0.3 秒
 mops_client = MopsClient()
 
 
@@ -408,8 +408,8 @@ def _raise_for_mops_error(error: MopsApiError):
 
 
 @app.get("/api/mops/news", dependencies=[Depends(verify_api_key)])
-def get_material_news(company_ids: str = Query(alias="companyIds", max_length=80)) -> dict:
-    """多家公司近一個月內的重大訊息（MOPS 每家最多提供最近 10 筆），companyIds 以逗號分隔（最多 10 家）；
+def get_material_news(company_ids: str = Query(alias="companyIds", max_length=250)) -> dict:
+    """多家公司近一個月內的重大訊息（MOPS 每家最多提供最近 10 筆），companyIds 以逗號分隔（最多 MOPS_MAX_COMPANIES 家）；
     個別公司查詢失敗列於 errors。"""
     ids = [value.strip().upper() for value in company_ids.split(",") if value.strip()]
     if not ids or len(ids) > MOPS_MAX_COMPANIES or not all(re.fullmatch(r"[0-9A-Z]{4,6}", i) for i in ids):
