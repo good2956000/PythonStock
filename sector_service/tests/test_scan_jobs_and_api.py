@@ -198,6 +198,20 @@ class TestAnalysisEndpoints:
         assert requested == ["6488.TW", "6488.TWO"]
         assert response.json()["ticker"] == "6488.TWO"
 
+    def test_signal_analysis_treats_letter_suffix_code_as_taiwan_stock(self, api_client, monkeypatch, price_frame_factory):
+        requested = []
+
+        def fake_download(ticker, period=None, start=None):
+            requested.append(ticker)
+            return price_frame_factory([100 + (i % 7) for i in range(200)])
+
+        monkeypatch.setattr(main.market_data, "download_single_history", fake_download)
+
+        response = api_client.get("/api/stocks/00631L/signal-analysis?period=1y", headers={"X-Api-Key": API_KEY})
+
+        assert response.status_code == 200
+        assert requested == ["00631L.TW"]
+
     def test_signal_analysis_rejects_invalid_period(self, api_client):
         response = api_client.get("/api/stocks/2330/signal-analysis?period=99y", headers={"X-Api-Key": API_KEY})
 

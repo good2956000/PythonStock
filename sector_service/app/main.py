@@ -47,7 +47,9 @@ SECTOR_CACHE_FILE = os.getenv(
 DOWNLOAD_CHUNK_DELAY_SECONDS = float(os.getenv("DOWNLOAD_CHUNK_DELAY_SECONDS", "1"))
 TICKER_PATTERN = re.compile(r"^\d{4}\.(TW|TWO)$")
 # 個股分析接受純數字台股代號（自動判斷上市 / 上櫃）、含後綴的台股代號或美股代號
-STOCK_CODE_PATTERN = re.compile(r"^(\d{4,6}(\.(TW|TWO))?|[A-Z]{1,5})$")
+STOCK_CODE_PATTERN = re.compile(r"^(\d{4,6}[A-Z]?(\.(TW|TWO))?|[A-Z]{1,5})$")
+# 台股代號（純數字或數字加一個英文字尾，例如 00631L），不含 .TW / .TWO 後綴
+TAIWAN_CODE_PATTERN = re.compile(r"^\d{4,6}[A-Z]?$")
 JOB_ID_PATTERN = r"^[0-9a-f]{32}$"
 SECTOR_ID_PATTERN = r"^[A-Z]?\d{1,4}$"
 
@@ -259,7 +261,7 @@ def get_signal_analysis(code: str, period: str = Query(default="1y")) -> dict:
         raise HTTPException(status_code=400, detail="Invalid period")
 
     # 純數字代號先試上市（.TW），查無資料再試上櫃（.TWO），與原腳本相同
-    candidates = [code + ".TW", code + ".TWO"] if code.isdigit() else [code]
+    candidates = [code + ".TW", code + ".TWO"] if TAIWAN_CODE_PATTERN.match(code) else [code]
     for ticker in candidates:
         frame = market_data.download_single_history(ticker, period=period)
         if frame is not None and not frame.empty:
