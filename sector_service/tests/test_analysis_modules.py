@@ -102,6 +102,21 @@ class TestRebound:
         assert bucket["upCount"] == 1        # 95 → 21 個交易日後 96，上漲
         assert result["details"][0]["dailyReturn"] == pytest.approx(-5.0)
 
+    def test_detail_includes_next_month_date_and_close(self):
+        closes = [100.0] * 30
+        closes[5] = 95.0            # 單日 -5%
+        for i in range(6, 30):
+            closes[i] = 96.0 + i    # 第 26 個交易日（5 + 21）收盤 122
+        index = pd.bdate_range("2026-01-01", periods=len(closes))
+        frame = pd.DataFrame({"Close": closes}, index=index)
+
+        detail = market_analysis.analyze_rebound(frame)["details"][0]
+
+        # 隔月 = 往後第 21 個交易日；隔月漲跌 = 隔月收盤 / 當日收盤 - 1
+        assert detail["nextMonthDate"] == index[5 + 21].strftime("%Y-%m-%d")
+        assert detail["nextMonthClose"] == pytest.approx(122.0)
+        assert detail["nextMonthReturn"] == pytest.approx(round((122.0 / 95.0 - 1) * 100, 2))
+
     def test_keeps_latest_close_and_marks_pending_next_month(self):
         closes = [100.0] * 40
         closes[5] = 95.0            # 單日 -5%，21 個交易日後已有結果
@@ -132,6 +147,7 @@ class TestRebound:
         assert (settled_bucket["sampleCount"], settled_bucket["pendingCount"], settled_bucket["upRate"]) == (1, 0, 100.0)
 
         assert [row["nextMonthReturn"] is None for row in result["details"]] == [False, True]
+        assert (result["details"][1]["nextMonthDate"], result["details"][1]["nextMonthClose"]) == (None, None)
         assert (result["detailUpCount"], result["detailDownCount"], result["detailPendingCount"]) == (1, 0, 1)
 
     @pytest.mark.parametrize("now, expected_last", [

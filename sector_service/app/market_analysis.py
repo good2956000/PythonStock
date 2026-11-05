@@ -150,7 +150,10 @@ def analyze_rebound(index_frame: pd.DataFrame) -> Dict:
     """
     frame = index_frame[["Close"]].copy()
     frame["Return_T"] = frame["Close"].pct_change() * 100
-    frame["Return_T1"] = frame["Close"].pct_change(periods=MONTH_TRADING_DAYS).shift(-MONTH_TRADING_DAYS) * 100
+    # 隔月 = 往後第 21 個交易日的收盤；隔月漲跌 = (隔月收盤 / 當日收盤 - 1) × 100
+    frame["Close_T1"] = frame["Close"].shift(-MONTH_TRADING_DAYS)
+    frame["Date_T1"] = pd.Series(frame.index, index=frame.index).shift(-MONTH_TRADING_DAYS)
+    frame["Return_T1"] = (frame["Close_T1"] / frame["Close"] - 1) * 100
     # 只去掉第一列（沒有前一日可比較）；隔月報酬為 NaN 的最近一個月要保留
     frame = frame.dropna(subset=["Return_T"])
     settled_frame = frame.dropna(subset=["Return_T1"])
@@ -185,6 +188,9 @@ def analyze_rebound(index_frame: pd.DataFrame) -> Dict:
         "date": date.strftime("%Y-%m-%d"),
         "close": to_float(row["Close"], 2),
         "dailyReturn": to_float(row["Return_T"], 2),
+        # 隔月（第 21 個交易日）的日期與收盤；未滿 21 個交易日時為 None
+        "nextMonthDate": row["Date_T1"].strftime("%Y-%m-%d") if pd.notna(row["Date_T1"]) else None,
+        "nextMonthClose": to_float(row["Close_T1"], 2),
         "nextMonthReturn": to_float(row["Return_T1"], 2),
     } for date, row in details.iterrows()]
     settled_details = details.dropna(subset=["Return_T1"])
