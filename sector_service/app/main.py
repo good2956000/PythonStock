@@ -276,9 +276,59 @@ def get_signal_analysis(code: str, period: str = Query(default="1y")) -> dict:
 # ---------------------------------------------------------------------------
 # 大盤分析（stock_all.py / market_rebound.py / market_margin.py）
 # ---------------------------------------------------------------------------
-@app.get("/api/market/kd-backtest", dependencies=[Depends(verify_api_key)])
-def get_kd_backtest(start_date: date = Query(default=date(2020, 6, 1), alias="startDate")) -> dict:
-    """大盤 KD 波段策略回測 0050。"""
+def kd_band_parameters(
+    kd_period: int = Query(default=market_analysis.KD_PERIOD, alias="kdPeriod", ge=2, le=60),
+    k_smoothing: int = Query(default=market_analysis.K_SMOOTHING, alias="kSmoothing", ge=1, le=20),
+    d_smoothing: int = Query(default=market_analysis.D_SMOOTHING, alias="dSmoothing", ge=1, le=20),
+    ma_period: int = Query(default=market_analysis.MA_PERIOD, alias="maPeriod", ge=2, le=240),
+    buy_k_threshold: float = Query(default=market_analysis.BUY_K_THRESHOLD, alias="buyKThreshold", ge=0, le=100),
+    take_profit_k_threshold: float = Query(
+        default=market_analysis.TAKE_PROFIT_K_THRESHOLD, alias="takeProfitKThreshold", ge=0, le=100),
+    take_profit_bias_percent: float = Query(
+        default=market_analysis.TAKE_PROFIT_BIAS_PERCENT, alias="takeProfitBiasPercent", ge=-30, le=50),
+    trend_break_k_threshold: float = Query(
+        default=market_analysis.TREND_BREAK_K_THRESHOLD, alias="trendBreakKThreshold", ge=0, le=100),
+    trailing_stop_method: str = Query(
+        default=market_analysis.TRAILING_STOP_METHOD, alias="trailingStopMethod",
+        pattern=f"^({'|'.join(market_analysis.TRAILING_STOP_METHODS)})$"),
+    trailing_stop_source: str = Query(
+        default=market_analysis.TRAILING_STOP_SOURCE, alias="trailingStopSource",
+        pattern=f"^({'|'.join(market_analysis.TRAILING_SOURCES)})$"),
+    trailing_ma_period: int = Query(default=market_analysis.TRAILING_MA_PERIOD, alias="trailingMaPeriod", ge=2, le=240),
+    trailing_ma_filter: str = Query(
+        default=market_analysis.TRAILING_MA_FILTER, alias="trailingMaFilter",
+        pattern=f"^({'|'.join(market_analysis.MA_FILTERS)})$"),
+    trailing_ma_confirm_days: int = Query(
+        default=market_analysis.TRAILING_MA_CONFIRM_DAYS, alias="trailingMaConfirmDays", ge=1, le=20),
+    trailing_ma_break_percent: float = Query(
+        default=market_analysis.TRAILING_MA_BREAK_PERCENT, alias="trailingMaBreakPercent", ge=0, le=30),
+    trailing_drawdown_percent: float = Query(
+        default=market_analysis.TRAILING_DRAWDOWN_PERCENT, alias="trailingDrawdownPercent", gt=0, le=50),
+    atr_period: int = Query(default=market_analysis.ATR_PERIOD, alias="atrPeriod", ge=2, le=60),
+    atr_multiplier: float = Query(default=market_analysis.ATR_MULTIPLIER, alias="atrMultiplier", gt=0, le=10),
+    swing_low_lookback: int = Query(default=market_analysis.SWING_LOW_LOOKBACK, alias="swingLowLookback", ge=2, le=120),
+    transaction_costs_enabled: bool = Query(
+        default=market_analysis.TRANSACTION_COSTS_ENABLED, alias="transactionCostsEnabled"),
+    fee_rate_percent: float = Query(default=market_analysis.FEE_RATE_PERCENT, alias="feeRatePercent", ge=0, le=1),
+    fee_discount: float = Query(default=market_analysis.FEE_DISCOUNT, alias="feeDiscount", ge=0, le=1),
+    sell_tax_percent: float = Query(default=market_analysis.SELL_TAX_PERCENT, alias="sellTaxPercent", ge=0, le=1),
+) -> market_analysis.KdBandParameters:
+    """KD 波段策略參數（回測與最佳化共用）；未指定的參數使用 market_analysis.py 最上方的預設值。"""
+    return market_analysis.KdBandParameters(
+        kd_period=kd_period, k_smoothing=k_smoothing, d_smoothing=d_smoothing, ma_period=ma_period,
+        buy_k_threshold=buy_k_threshold, take_profit_k_threshold=take_profit_k_threshold,
+        take_profit_bias_percent=take_profit_bias_percent, trend_break_k_threshold=trend_break_k_threshold,
+        trailing_stop_method=trailing_stop_method, trailing_stop_source=trailing_stop_source,
+        trailing_ma_period=trailing_ma_period, trailing_ma_filter=trailing_ma_filter,
+        trailing_ma_confirm_days=trailing_ma_confirm_days, trailing_ma_break_percent=trailing_ma_break_percent,
+        trailing_drawdown_percent=trailing_drawdown_percent, atr_period=atr_period, atr_multiplier=atr_multiplier,
+        swing_low_lookback=swing_low_lookback, transaction_costs_enabled=transaction_costs_enabled,
+        fee_rate_percent=fee_rate_percent, fee_discount=fee_discount, sell_tax_percent=sell_tax_percent,
+    )
+
+
+def _load_kd_prices(start_date: date):
+    """下載加權指數與 0050 日 K；盤中只算到前一個收盤日，避免以即時價產生訊號。"""
     if start_date < date(2005, 1, 1) or start_date >= date.today():
         raise HTTPException(status_code=400, detail="startDate must be between 2005-01-01 and yesterday")
     start = start_date.isoformat()
@@ -286,7 +336,37 @@ def get_kd_backtest(start_date: date = Query(default=date(2020, 6, 1), alias="st
     etf = market_data.download_single_history(ETF_TICKER, start=start)
     if twii is None or etf is None:
         raise HTTPException(status_code=502, detail="Unable to download price data")
-    return market_analysis.run_kd_band_backtest(twii, etf)
+    taipei_now = datetime.now(TAIPEI_TIMEZONE)
+    return market_analysis.drop_unclosed_session(twii, taipei_now), market_analysis.drop_unclosed_session(etf, taipei_now)
+
+
+@app.get("/api/market/kd-backtest", dependencies=[Depends(verify_api_key)])
+def get_kd_backtest(
+    start_date: date = Query(default=date(2020, 6, 1), alias="startDate"),
+    parameters: market_analysis.KdBandParameters = Depends(kd_band_parameters),
+) -> dict:
+    """大盤 KD 波段策略回測 0050；KD 天數、月線天數、各門檻、移動停利（擇一）與交易成本可由查詢參數調整。"""
+    twii, etf = _load_kd_prices(start_date)
+    return market_analysis.run_kd_band_backtest(twii, etf, parameters)
+
+
+@app.get("/api/market/kd-backtest/optimize", dependencies=[Depends(verify_api_key)])
+def get_kd_backtest_optimization(
+    start_date: date = Query(default=date(2020, 6, 1), alias="startDate"),
+    parameters: market_analysis.KdBandParameters = Depends(kd_band_parameters),
+    trials: int = Query(default=market_analysis.OPTIMIZE_TRIALS, ge=10, le=10000),
+    train_ratio: float = Query(default=market_analysis.OPTIMIZE_TRAIN_RATIO, alias="trainRatio", ge=0.5, le=0.9),
+    min_trades: int = Query(default=market_analysis.OPTIMIZE_MIN_TRADES, alias="minTrades", ge=0, le=50),
+) -> dict:
+    """隨機搜尋 KD 波段策略參數：依訓練期累積報酬排序，並列出驗證期與全期間報酬。
+
+    目前的參數會列為第一組比較；交易成本與停利判斷價格沿用目前設定，不參與搜尋。
+    """
+    twii, etf = _load_kd_prices(start_date)
+    try:
+        return market_analysis.optimize_kd_band(twii, etf, parameters, trials=trials, train_ratio=train_ratio, min_trades=min_trades)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
 
 
 @app.get("/api/market/rebound", dependencies=[Depends(verify_api_key)])

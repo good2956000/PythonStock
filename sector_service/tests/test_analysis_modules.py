@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime
 
 import numpy as np
@@ -79,9 +80,289 @@ class TestKdBandBacktest:
         for signal in result["signals"]:
             if signal["executionDate"]:
                 assert signal["executionDate"] > signal["signalDate"]
-        # 每一輪交易都是先進場後出場
+        # 每一輪交易都是先進場後出場（尚未出場的一輪出場日為 None）
         for trip in result["roundTrips"]:
-            assert trip["exitDate"] > trip["entryDate"]
+            assert trip["isOpen"] == (trip["exitDate"] is None)
+            if trip["exitDate"]:
+                assert trip["exitDate"] > trip["entryDate"]
+
+    def test_default_parameters_match_traditional_kd(self):
+        prices = make_wave_prices(days=400)
+
+        default = market_analysis.run_kd_band_backtest(prices, prices)
+        explicit = market_analysis.run_kd_band_backtest(prices, prices, market_analysis.KdBandParameters(
+            kd_period=9, k_smoothing=3, d_smoothing=3, ma_period=20, buy_k_threshold=20,
+            take_profit_k_threshold=80, take_profit_bias_percent=3.5, trend_break_k_threshold=50))
+
+        assert default["signals"] == explicit["signals"]
+        assert default["parameters"] == {
+            "kdPeriod": 9, "kSmoothing": 3, "dSmoothing": 3, "maPeriod": 20, "buyKThreshold": 20.0,
+            "takeProfitKThreshold": 80.0, "takeProfitBiasPercent": 3.5, "trendBreakKThreshold": 50.0,
+            "trailingStopMethod": "none", "trailingStopSource": "etf", "trailingMaPeriod": 60,
+            "trailingMaFilter": "consecutive", "trailingMaConfirmDays": 3, "trailingMaBreakPercent": 3.0,
+            "trailingDrawdownPercent": 10.0, "atrPeriod": 14, "atrMultiplier": 3.0, "swingLowLookback": 20,
+            "transactionCostsEnabled": True, "feeRatePercent": 0.1425, "feeDiscount": 1.0, "sellTaxPercent": 0.1,
+        }
+        assert default["signalCount"] > 0
+        # 不使用移動停利時，賣出原因只會是 A / B
+        assert all("trailingStop" not in s["reasons"] for s in default["signals"])
+
+    def test_thresholds_change_buy_and_sell_conditions(self):
+        prices = make_wave_prices(days=400)
+        run = lambda **kwargs: market_analysis.run_kd_band_backtest(prices, prices, market_analysis.KdBandParameters(**kwargs))
+
+        # 昨日 K 不可能 < 0 → 不會有買進訊號
+        assert all(s["direction"] == "sell" for s in run(buy_k_threshold=0)["signals"])
+        # 放寬低檔門檻 → 買進訊號只會變多
+        count_buys = lambda result: sum(s["direction"] == "buy" for s in result["signals"])
+        assert count_buys(run(buy_k_threshold=50)) >= count_buys(run())
+        # 昨日 K 不可能 > 100、今日 K 不可能 < 0 → 兩種賣出情境都不成立
+        no_sell = run(take_profit_k_threshold=100, trend_break_k_threshold=0)
+        assert all(s["direction"] == "buy" for s in no_sell["signals"])
+        # 改變 KD 天數與平滑會得到不同的訊號
+        assert run(kd_period=14, k_smoothing=5, d_smoothing=5)["signals"] != run()["signals"]
+
+
+class TestKdBandReturns:
+    """累積報酬以「訊號隔日收盤成交」計算，與每輪交易表一致；可扣交易成本；附 0050 買進持有對照。"""
+
+    @pytest.mark.parametrize("costs_enabled", [True, False])
+    @pytest.mark.parametrize("method", ["none", "swing_low"])
+    def test_cumulative_return_equals_compounded_round_trips(self, costs_enabled, method):
+        prices = make_wave_prices(days=400)
+        parameters = market_analysis.KdBandParameters(trailing_stop_method=method, transaction_costs_enabled=costs_enabled)
+
+        result = market_analysis.run_kd_band_backtest(prices, prices, parameters)
+
+        compounded = np.prod([1 + trip["netReturnPercent"] / 100 for trip in result["roundTrips"]])
+        assert len(result["roundTrips"]) > 3
+        assert 1 + result["cumulativeReturnPercent"] / 100 == pytest.approx(compounded, rel=2e-3)
+
+    def test_position_starts_after_execution_day_close(self):
+        prices = make_wave_prices(days=400)
+        result = market_analysis.run_kd_band_backtest(prices, prices, market_analysis.KdBandParameters(transaction_costs_enabled=False))
+        dates = result["candles"]["dates"]
+        curve = result["equityCurve"]
+        first_entry = dates.index(result["roundTrips"][0]["entryDate"])
+
+        # 訊號日與成交日當天淨值都不變（成交日以收盤價買進），成交日隔天才開始反映 0050 漲跌
+        assert curve[first_entry] == pytest.approx(curve[first_entry - 1], abs=1e-4)   # 輸出四捨五入到小數 4 位
+        closes = prices["Close"].to_numpy()
+        expected = curve[first_entry] * closes[first_entry + 1] / closes[first_entry]
+        assert curve[first_entry + 1] == pytest.approx(expected, abs=1e-4)
+
+    def test_costs_and_buy_and_hold_benchmark(self):
+        prices = make_wave_prices(days=400)
+        discounted = market_analysis.KdBandParameters(fee_discount=0.28)
+
+        result = market_analysis.run_kd_band_backtest(prices, prices, discounted)
+        free = market_analysis.run_kd_band_backtest(prices, prices, market_analysis.KdBandParameters(transaction_costs_enabled=False))
+
+        # 2.8 折：買進 0.1425% × 0.28 = 0.0399%；賣出再加證交稅 0.1%
+        assert result["buyCostPercent"] == pytest.approx(0.0399)
+        assert result["sellCostPercent"] == pytest.approx(0.1399)
+        assert all(trip["netReturnPercent"] < trip["returnPercent"] for trip in result["roundTrips"])
+        assert all(trip["netReturnPercent"] == trip["returnPercent"] for trip in free["roundTrips"])
+        assert result["cumulativeReturnPercent"] < free["cumulativeReturnPercent"]
+
+        closes = prices["Close"]
+        expected_hold = (closes.iloc[-1] / closes.iloc[0] * (1 - 0.000399) - 1) * 100
+        assert result["buyAndHoldReturnPercent"] == pytest.approx(expected_hold, abs=0.01)
+        assert len(result["buyAndHoldCurve"]) == len(result["equityCurve"])
+        assert 0 < result["exposurePercent"] < 100
+
+
+def parameters_from_camel(camel: dict) -> market_analysis.KdBandParameters:
+    snake = {re.sub(r"([A-Z])", lambda m: "_" + m.group(1).lower(), key): value for key, value in camel.items()}
+    return market_analysis.KdBandParameters(**snake)
+
+
+class TestOptimize:
+    """參數最佳化：訓練期挑參數、驗證期檢查。"""
+
+    def test_ranks_by_training_return_and_reports_validation(self):
+        prices = make_wave_prices(days=500)
+        base = market_analysis.KdBandParameters(fee_discount=0.5)
+
+        result = market_analysis.optimize_kd_band(prices, prices, base, trials=150, train_ratio=0.7, min_trades=2)
+
+        json.dumps(result)
+        assert result["trials"] == 150
+        assert result["splitDate"] == prices.index[int(500 * 0.7)].strftime("%Y-%m-%d")
+        # 第一組為目前設定
+        assert parameters_from_camel(result["current"]["parameters"]) == base
+        top = result["top"]
+        assert 0 < len(top) <= market_analysis.OPTIMIZE_TOP_N
+        assert [row["trainReturnPercent"] for row in top] == sorted((row["trainReturnPercent"] for row in top), reverse=True)
+        assert all(row["trainTrades"] >= 2 for row in top)
+        # 交易成本沿用目前設定、不參與搜尋
+        assert all(row["parameters"]["feeDiscount"] == 0.5 for row in top)
+        # 搜尋出的組合不重複
+        identities = [json.dumps(row["parameters"], sort_keys=True) for row in top]
+        assert len(identities) == len(set(identities))
+
+    def test_segments_match_full_backtest(self):
+        prices = make_wave_prices(days=500)
+        result = market_analysis.optimize_kd_band(prices, prices, trials=60, min_trades=1)
+        best = result["top"][0]
+
+        full = market_analysis.run_kd_band_backtest(prices, prices, parameters_from_camel(best["parameters"]))
+
+        assert best["fullReturnPercent"] == pytest.approx(full["cumulativeReturnPercent"], abs=0.01)
+        # 訓練期與驗證期報酬連乘 = 全期間報酬
+        compounded = (1 + best["trainReturnPercent"] / 100) * (1 + best["validationReturnPercent"] / 100)
+        assert compounded == pytest.approx(1 + best["fullReturnPercent"] / 100, rel=1e-3)
+
+    def test_same_seed_gives_same_result(self):
+        prices = make_wave_prices(days=400)
+
+        first = market_analysis.optimize_kd_band(prices, prices, trials=50)
+        second = market_analysis.optimize_kd_band(prices, prices, trials=50)
+
+        assert first == second
+
+    def test_min_trades_filters_lucky_combinations(self):
+        prices = make_wave_prices(days=400)
+
+        result = market_analysis.optimize_kd_band(prices, prices, trials=80, min_trades=1000)
+
+        assert result["top"] == []
+        assert result["qualifiedTrials"] == 0
+
+    def test_rejects_too_short_period(self):
+        prices = make_wave_prices(days=60)
+
+        with pytest.raises(ValueError):
+            market_analysis.optimize_kd_band(prices, prices, trials=10)
+
+
+class TestTrailingStops:
+    """賣出 C：移動停利（每次回測只選一種）。"""
+
+    @staticmethod
+    def simulate(closes, method, atr=None, prior_low=None, ma_trigger=None, **kwargs):
+        days = len(closes)
+        buy = np.zeros(days, dtype=bool)
+        buy[0] = True                                   # 第 0 天買進訊號，第 1 天進場開始追蹤
+        series = {
+            "close": np.array(closes, dtype=float),
+            "atr": np.array(atr if atr is not None else [np.nan] * days, dtype=float),
+            "priorLow": np.array(prior_low if prior_low is not None else [np.nan] * days, dtype=float),
+            "maTrigger": np.array(ma_trigger if ma_trigger is not None else [False] * days, dtype=bool),
+        }
+        parameters = market_analysis.KdBandParameters(trailing_stop_method=method, **kwargs)
+        signals, hits = market_analysis._simulate_signals(buy, np.zeros(days, dtype=bool), series, parameters)
+        return signals.tolist(), hits.tolist()
+
+    def test_none_matches_sell_first_then_buy(self):
+        rng = np.random.default_rng(3)
+        buy, sell = rng.random(300) < 0.1, rng.random(300) < 0.1
+        series = {"close": np.ones(300), "atr": np.ones(300), "priorLow": np.ones(300), "maTrigger": np.zeros(300, dtype=bool)}
+
+        signals, hits = market_analysis._simulate_signals(buy, sell, series, market_analysis.KdBandParameters())
+
+        assert signals.tolist() == np.where(sell, -1, np.where(buy, 1, 0)).tolist()
+        assert not hits.any()
+
+    def test_percent_drawdown_from_highest_close(self):
+        # 進場後最高收盤 120，回落 10% → 108 出場
+        signals, hits = self.simulate([100, 100, 110, 120, 108, 107], "percent", trailing_drawdown_percent=10)
+
+        assert signals == [1, 0, 0, 0, -1, 0]
+        assert hits[4]
+
+    def test_atr_trailing_stop(self):
+        # 最高收盤 120 − 3 × ATR(3) = 111，收盤 111 不出場、110.9 出場
+        signals, _ = self.simulate([100, 100, 110, 120, 113, 111, 110.9], "atr", atr=[3.0] * 7, atr_multiplier=3)
+
+        assert signals == [1, 0, 0, 0, 0, 0, -1]
+
+    def test_swing_low_moves_up_only_on_new_highs(self):
+        prior_low = [np.nan, 95, 96, 99, 100, 101]
+        # 新高日停利點依序上移到 95 → 96 → 99；第 4 天沒有新高，停利點維持 99
+        stays, _ = self.simulate([100, 101, 103, 105, 104, 100], "swing_low", prior_low=prior_low)
+        breaks, _ = self.simulate([100, 101, 103, 105, 104, 98], "swing_low", prior_low=prior_low)
+
+        assert stays == [1, 0, 0, 0, 0, 0]
+        assert breaks == [1, 0, 0, 0, 0, -1]
+
+    def test_moving_average_trigger_only_while_holding(self):
+        # 進場前的跌破不算；持有中的跌破觸發才出場
+        signals, _ = self.simulate([100] * 5, "ma", ma_trigger=[False, False, False, True, False])
+        before_entry, _ = self.simulate([100] * 3, "ma", ma_trigger=[True, False, False])
+
+        assert signals == [-1 if i == 3 else (1 if i == 0 else 0) for i in range(5)]
+        assert before_entry == [1, 0, 0]    # 尚未持有時的跌破不產生賣出，照常買進
+
+    @pytest.mark.parametrize("ma_filter, expected_index", [("consecutive", 7), ("percent", 6), ("both", 7), ("either", 6)])
+    def test_moving_average_filters_trigger_on_first_day(self, ma_filter, expected_index):
+        closes = [10.0] * 6 + [8.0, 7.0, 6.0, 5.0]
+        frame = pd.DataFrame({"TWII_C": closes, "TWII_H": closes, "TWII_L": closes, "ETF_0050": closes},
+                             index=pd.bdate_range("2026-01-01", periods=len(closes)))
+        parameters = market_analysis.KdBandParameters(
+            trailing_stop_source="index", trailing_ma_period=3, trailing_ma_filter=ma_filter,
+            trailing_ma_confirm_days=2, trailing_ma_break_percent=10)
+
+        trigger = market_analysis._trailing_stop_series(frame, parameters)["maTrigger"]
+
+        # 3 日均線：第 6 天收盤 8 < 均線 9.33（跌破 14%），第 7 天連續 2 日低於均線；之後不再重複觸發
+        assert [i for i, value in enumerate(trigger) if value] == [expected_index]
+
+    @pytest.mark.parametrize("method", ["ma", "percent", "atr", "swing_low"])
+    def test_each_method_runs_end_to_end(self, method):
+        prices = make_wave_prices(days=400)
+        parameters = market_analysis.KdBandParameters(
+            trailing_stop_method=method, trailing_ma_period=20, trailing_ma_confirm_days=1,
+            trailing_drawdown_percent=2, atr_multiplier=1, swing_low_lookback=5)
+
+        result = market_analysis.run_kd_band_backtest(prices, prices, parameters)
+
+        json.dumps(result)
+        assert result["parameters"]["trailingStopMethod"] == method
+        assert any("trailingStop" in s["reasons"] for s in result["signals"])
+        assert all(s["reasons"] == [] for s in result["signals"] if s["direction"] == "buy")
+
+    def test_rejects_unknown_method(self):
+        with pytest.raises(ValueError):
+            market_analysis.KdBandParameters(trailing_stop_method="unknown")
+
+    def test_open_position_is_listed_with_unrealized_return(self):
+        prices = make_wave_prices(days=400)
+        full = market_analysis.run_kd_band_backtest(prices, prices)
+        dates = [d.strftime("%Y-%m-%d") for d in prices.index]
+        # 找一次進場後至少 3 個交易日內沒有出場的進場日，把資料截到進場後第 2 個交易日
+        entry_date = next(
+            buy for buy in full["buyMarkers"]
+            if all(not (buy < sell <= dates[dates.index(buy) + 3]) for sell in full["sellMarkers"])
+        )
+        last_index = dates.index(entry_date) + 2
+        truncated = prices.iloc[: last_index + 1]
+
+        result = market_analysis.run_kd_band_backtest(truncated, truncated)
+
+        open_trip = result["roundTrips"][-1]
+        entry_close = float(truncated.loc[entry_date, "Close"])
+        last_close = float(truncated["Close"].iloc[-1])
+        assert open_trip["isOpen"] is True
+        assert open_trip["entryDate"] == entry_date
+        assert open_trip["exitDate"] is None
+        assert open_trip["holdingDays"] == (truncated.index[-1] - pd.Timestamp(entry_date)).days
+        assert open_trip["returnPercent"] == pytest.approx(round((last_close / entry_close - 1) * 100, 2))
+        assert result["openPositionSince"] == entry_date
+        assert sum(not trip["isOpen"] for trip in result["roundTrips"]) == len(result["roundTrips"]) - 1
+
+    def test_missing_etf_day_does_not_drop_index_day(self):
+        prices = make_wave_prices(days=400)
+        etf_with_gap = prices.drop(prices.index[200])
+
+        full = market_analysis.run_kd_band_backtest(prices, prices)
+        result = market_analysis.run_kd_band_backtest(prices, etf_with_gap)
+
+        # KD 以大盤計算，0050 缺一天不影響訊號日與日期序列
+        assert result["candles"]["dates"] == full["candles"]["dates"]
+        assert [s["signalDate"] for s in result["signals"]] == [s["signalDate"] for s in full["signals"]]
+        assert result["candles"]["close"][200] is None
+        json.dumps(result)
 
 
 class TestRebound:

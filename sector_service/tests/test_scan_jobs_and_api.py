@@ -222,6 +222,80 @@ class TestAnalysisEndpoints:
 
         assert response.status_code == 400
 
+    def test_kd_backtest_passes_custom_parameters(self, api_client, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(main.market_data, "download_single_history", lambda ticker, **kwargs: pd.DataFrame({"Close": [1.0]}))
+        monkeypatch.setattr(main.market_analysis, "drop_unclosed_session", lambda frame, now: frame)
+
+        def fake_backtest(twii, etf, parameters):
+            captured["parameters"] = parameters
+            return {"parameters": parameters.to_camel_dict()}
+
+        monkeypatch.setattr(main.market_analysis, "run_kd_band_backtest", fake_backtest)
+        query = ("startDate=2020-06-01&kdPeriod=14&kSmoothing=2&dSmoothing=4&maPeriod=60"
+                 "&buyKThreshold=25&takeProfitKThreshold=85&takeProfitBiasPercent=5&trendBreakKThreshold=40")
+
+        response = api_client.get(f"/api/market/kd-backtest?{query}", headers={"X-Api-Key": API_KEY})
+
+        assert response.status_code == 200
+        assert captured["parameters"] == main.market_analysis.KdBandParameters(
+            kd_period=14, k_smoothing=2, d_smoothing=4, ma_period=60, buy_k_threshold=25,
+            take_profit_k_threshold=85, take_profit_bias_percent=5, trend_break_k_threshold=40)
+        assert response.json()["parameters"]["takeProfitBiasPercent"] == 5
+
+    def test_kd_backtest_passes_trailing_stop_parameters(self, api_client, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(main.market_data, "download_single_history", lambda ticker, **kwargs: pd.DataFrame({"Close": [1.0]}))
+        monkeypatch.setattr(main.market_analysis, "drop_unclosed_session", lambda frame, now: frame)
+        monkeypatch.setattr(main.market_analysis, "run_kd_band_backtest",
+                            lambda twii, etf, parameters: captured.setdefault("parameters", parameters) and {})
+        query = ("trailingStopMethod=swing_low&trailingStopSource=index&trailingMaPeriod=20&trailingMaFilter=either"
+                 "&trailingMaConfirmDays=2&trailingMaBreakPercent=5&trailingDrawdownPercent=15&atrPeriod=10"
+                 "&atrMultiplier=2.5&swingLowLookback=30&transactionCostsEnabled=false&feeRatePercent=0.1"
+                 "&feeDiscount=0.28&sellTaxPercent=0.15")
+
+        response = api_client.get(f"/api/market/kd-backtest?{query}", headers={"X-Api-Key": API_KEY})
+
+        assert response.status_code == 200
+        p = captured["parameters"]
+        assert (p.trailing_stop_method, p.trailing_stop_source, p.trailing_ma_period, p.trailing_ma_filter) == ("swing_low", "index", 20, "either")
+        assert (p.trailing_ma_confirm_days, p.trailing_ma_break_percent, p.trailing_drawdown_percent) == (2, 5, 15)
+        assert (p.atr_period, p.atr_multiplier, p.swing_low_lookback) == (10, 2.5, 30)
+        assert (p.transaction_costs_enabled, p.fee_rate_percent, p.fee_discount, p.sell_tax_percent) == (False, 0.1, 0.28, 0.15)
+
+    def test_kd_optimize_passes_settings_and_parameters(self, api_client, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(main.market_data, "download_single_history", lambda ticker, **kwargs: pd.DataFrame({"Close": [1.0]}))
+        monkeypatch.setattr(main.market_analysis, "drop_unclosed_session", lambda frame, now: frame)
+
+        def fake_optimize(twii, etf, parameters, trials, train_ratio, min_trades):
+            captured.update(parameters=parameters, trials=trials, train_ratio=train_ratio, min_trades=min_trades)
+            return {"top": []}
+
+        monkeypatch.setattr(main.market_analysis, "optimize_kd_band", fake_optimize)
+
+        response = api_client.get("/api/market/kd-backtest/optimize?trials=500&trainRatio=0.8&minTrades=3&feeDiscount=0.28",
+                                  headers={"X-Api-Key": API_KEY})
+
+        assert response.status_code == 200
+        assert (captured["trials"], captured["train_ratio"], captured["min_trades"]) == (500, 0.8, 3)
+        assert captured["parameters"].fee_discount == 0.28
+
+    @pytest.mark.parametrize("query", ["trials=5", "trials=20000", "trainRatio=0.3", "trainRatio=0.95", "minTrades=-1", "kdPeriod=1"])
+    def test_kd_optimize_rejects_out_of_range_settings(self, api_client, query):
+        response = api_client.get(f"/api/market/kd-backtest/optimize?{query}", headers={"X-Api-Key": API_KEY})
+
+        assert response.status_code == 422
+
+    @pytest.mark.parametrize("query", ["kdPeriod=1", "kSmoothing=0", "maPeriod=500", "buyKThreshold=101", "trendBreakKThreshold=-1",
+                                       "trailingStopMethod=magic", "trailingStopSource=tsmc", "trailingMaFilter=x",
+                                       "trailingDrawdownPercent=0", "atrMultiplier=11", "swingLowLookback=1",
+                                       "feeDiscount=2", "sellTaxPercent=-0.1", "transactionCostsEnabled=maybe"])
+    def test_kd_backtest_rejects_out_of_range_parameters(self, api_client, query):
+        response = api_client.get(f"/api/market/kd-backtest?{query}", headers={"X-Api-Key": API_KEY})
+
+        assert response.status_code == 422
+
     def test_margin_days_out_of_range_is_rejected(self, api_client):
         response = api_client.get("/api/market/margin?days=5000", headers={"X-Api-Key": API_KEY})
 
