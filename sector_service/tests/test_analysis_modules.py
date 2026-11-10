@@ -68,6 +68,40 @@ class TestSignalAnalysis:
     def test_returns_none_when_not_enough_data(self):
         assert signal_analysis.analyze_price_history("2330.TW", make_wave_prices(days=40)) is None
 
+    def test_bollinger_bands_match_manual_calculation(self):
+        prices = make_wave_prices()
+        result = signal_analysis.analyze_price_history("2330.TW", prices)
+
+        last_20 = prices["Close"].iloc[-20:]
+        middle, std = last_20.mean(), last_20.std(ddof=0)
+        upper, lower = middle + 2 * std, middle - 2 * std
+        latest = result["latest"]
+        assert latest["bollingerMiddle"] == pytest.approx(middle, abs=0.01)
+        assert latest["bollingerUpper"] == pytest.approx(upper, abs=0.01)
+        assert latest["bollingerLower"] == pytest.approx(lower, abs=0.01)
+        assert latest["bollingerWidth"] == pytest.approx((upper - lower) / middle * 100, abs=0.01)
+        assert latest["bollingerPercentB"] == pytest.approx((prices["Close"].iloc[-1] - lower) / (upper - lower) * 100, abs=0.1)
+        assert result["series"]["bollingerUpper"][-1] == pytest.approx(upper, abs=0.0001)
+
+    def test_bollinger_does_not_drop_trading_days(self):
+        # 布林通道只需 20 日資料，暖機期由 MA60 決定，加入後交易日數不變
+        result = signal_analysis.analyze_price_history("2330.TW", make_wave_prices())
+
+        assert result["tradingDays"] == 260 - 59
+
+    @pytest.mark.parametrize("calm_tail, expected", [(True, True), (False, False)])
+    def test_bollinger_squeeze_when_recent_band_is_narrowest(self, calm_tail, expected):
+        prices = make_wave_prices(days=200)
+        if calm_tail:
+            # 最後 30 天幾乎不動，帶寬收斂到近 60 日最低
+            calm = prices["Close"].iloc[-31] + np.tile([0.0, 0.05], 15)
+            for column, offset in (("Open", -0.02), ("High", 0.1), ("Low", -0.1), ("Close", 0.0)):
+                prices.iloc[-30:, prices.columns.get_loc(column)] = calm + offset
+
+        result = signal_analysis.analyze_price_history("2330.TW", prices)
+
+        assert result["latest"]["bollingerSqueeze"] is expected
+
 
 class TestKdBandBacktest:
     def test_positions_are_delayed_one_day_and_output_is_serializable(self):

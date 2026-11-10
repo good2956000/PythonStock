@@ -1,4 +1,4 @@
-"""個股 RSI / MACD / KD 買賣訊號分析與動態出場回測（Domain 層）。
+"""個股 RSI / MACD / KD / 布林通道買賣訊號分析與動態出場回測（Domain 層）。
 
 移植自 PythonStock/stock_bias_bollinger.py，指標、訊號與出場規則維持原腳本行為。
 """
@@ -7,6 +7,12 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from .indicators import (
+    BOLLINGER_SQUEEZE_LOOKBACK,
+    BOLLINGER_SQUEEZE_QUANTILE,
+    BOLLINGER_STD_MULTIPLIER,
+    BOLLINGER_WINDOW,
+)
 from .serialization import dates_to_list, series_to_list, to_float
 
 STOP_LOSS_PCT = 0.07          # A 初始停損：帳面虧損達 7%
@@ -44,7 +50,22 @@ def add_signal_indicators(price_frame: pd.DataFrame) -> pd.DataFrame:
         frame[f"MA{window}"] = close.rolling(window=window).mean()
     frame["Volume_MA5"] = frame["Volume"].rolling(window=5).mean()
 
+    # 布林通道：參數與選股掃描（indicators.py）相同，中軌為 MA20，標準差採母體標準差（ddof=0）
+    rolling_std = close.rolling(window=BOLLINGER_WINDOW).std(ddof=0)
+    frame["BB_Upper"] = frame["MA20"] + BOLLINGER_STD_MULTIPLIER * rolling_std
+    frame["BB_Lower"] = frame["MA20"] - BOLLINGER_STD_MULTIPLIER * rolling_std
+
     frame = frame.dropna()
+
+    # 帶寬與 %b 在 dropna 之後計算：價格完全沒波動時通道寬度為 0、%b 無法計算（NaN），不可因此刪掉交易日
+    band_range = frame["BB_Upper"] - frame["BB_Lower"]
+    frame["BB_Width"] = band_range / frame["MA20"]
+    frame["BB_PercentB"] = (frame["Close"] - frame["BB_Lower"]) / band_range.replace(0, np.nan)
+    # 壓縮：今日帶寬落在近 60 個交易日的最低 20%（常見於變盤前）
+    squeeze_threshold = frame["BB_Width"].rolling(
+        window=BOLLINGER_SQUEEZE_LOOKBACK, min_periods=BOLLINGER_WINDOW
+    ).quantile(BOLLINGER_SQUEEZE_QUANTILE)
+    frame["BB_Squeeze"] = frame["BB_Width"] <= squeeze_threshold
 
     # RSI 訊號：跌破 70（前一天 > 70）為賣、<= 30 為買
     frame["RSI_SELL"] = (frame["RSI"].shift(1) > 70) & (frame["RSI"] <= 70)
@@ -244,6 +265,13 @@ def analyze_price_history(ticker: str, price_frame: pd.DataFrame) -> Optional[Di
             "k": to_float(latest["K"], 1),
             "d": to_float(latest["D"], 1),
             "entryScore": int(latest["ENTRY_SCORE"]),
+            "bollingerUpper": to_float(latest["BB_Upper"], 2),
+            "bollingerMiddle": to_float(latest["MA20"], 2),
+            "bollingerLower": to_float(latest["BB_Lower"], 2),
+            # 帶寬與 %b 以百分比表示：%b 100 = 收在上軌、0 = 收在下軌
+            "bollingerWidth": to_float(latest["BB_Width"] * 100, 2),
+            "bollingerPercentB": to_float(latest["BB_PercentB"] * 100, 1),
+            "bollingerSqueeze": bool(latest["BB_Squeeze"]),
         },
         "currentSignals": _current_signals(frame),
         "recentSignals": _recent_signal_rows(frame),
@@ -254,6 +282,8 @@ def analyze_price_history(ticker: str, price_frame: pd.DataFrame) -> Optional[Di
             "close": series_to_list(frame["Close"]),
             "ma20": series_to_list(frame["MA20"]),
             "ma60": series_to_list(frame["MA60"]),
+            "bollingerUpper": series_to_list(frame["BB_Upper"]),
+            "bollingerLower": series_to_list(frame["BB_Lower"]),
             "rsi": series_to_list(frame["RSI"], 2),
             "macd": series_to_list(frame["MACD"]),
             "signal": series_to_list(frame["SIGNAL"]),
