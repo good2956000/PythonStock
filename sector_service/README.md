@@ -27,6 +27,7 @@
 | `app/serialization.py` | Domain | pandas / numpy 結果轉 JSON（NaN → null） |
 | `app/market_data.py` | Infrastructure | 證交所產業清單與融資資料、Yahoo Finance 日 K 下載與快取 |
 | `app/scan_jobs.py` | Application | 背景掃描工作（單一執行緒依序處理） |
+| `app/optimize_jobs.py` | Application | KD 波段策略參數最佳化背景工作（同時只執行一個、可停止、結果存檔） |
 | `app/economic_calendar.py` | Domain | 全球日曆：重要指標清單（中文名稱、重要性）、最新值、政策利率 |
 | `app/fred_client.py` | Infrastructure | FRED API 用戶端（快取、重試、失敗時沿用舊資料，錯誤訊息不含金鑰） |
 | `app/main.py` | Presentation | FastAPI 端點、輸入驗證與 API Key 驗證 |
@@ -69,6 +70,13 @@ dotnet run
 | GET | `/api/stocks/{ticker}/indicators` | | 單一股票指標序列（`2330.TW`、`6488.TWO`） |
 | GET | `/api/stocks/{code}/signal-analysis` | `period`=3mo/6mo/1y/2y/5y | 純數字代號先試上市、查無再試上櫃 |
 | GET | `/api/market/kd-backtest` | `startDate`=YYYY-MM-DD（預設 2020-06-01） | |
+| GET | `/api/market/kd-backtest/optimize-options` | | 參數最佳化的預設搜尋範圍與上限 |
+| POST | `/api/market/kd-backtest/optimize-jobs` | 查詢參數同回測（目前設定）；內容 `{"mode": "random", "trials": 20000, "seed": null, "trainRatio": 0.7, "minTrades": 5, "space": {"kdPeriod": [5, 9]}}` | 建立最佳化工作；`mode`=random（隨機抽樣）/ exhaustive（完整搜尋）；已有工作執行中回傳 409 |
+| GET | `/api/market/kd-backtest/optimize-jobs/current` | | 執行中的工作（沒有時 `job` 為 null） |
+| GET | `/api/market/kd-backtest/optimize-jobs/{jobId}` | | 進度；完成後含結果 |
+| POST | `/api/market/kd-backtest/optimize-jobs/{jobId}/cancel` | | 停止工作（不存檔） |
+| GET | `/api/market/kd-backtest/optimize-results` | | 已存檔結果摘要（新到舊） |
+| GET | `/api/market/kd-backtest/optimize-results/{resultId}` | | 單筆已存檔結果與當時設定 |
 | GET | `/api/market/rebound` | `period`=2y/5y/10y/max（預設 5y） | |
 | GET | `/api/market/margin` | `days`=10~120（預設 60） | 首次約 30~40 秒，已公布日期會快取 |
 | GET | `/api/calendar` | `startDate`、`endDate`（最多 92 天）、`scope`=important/all | FRED 發布日程（含未來排程） |
@@ -93,6 +101,11 @@ dotnet run
 - Yahoo Finance 會對短時間大量請求回傳 `YFRateLimitError`，因此單一標的下載結果快取 10 分鐘
 - 族群批次下載每批 50 檔，批次間延遲 `DOWNLOAD_CHUNK_DELAY_SECONDS`（預設 1 秒）
 - 證交所融資資料逐日請求間隔 0.3 秒，成功取得的日期永久快取（服務重啟後清空）
+- KD 波段策略參數最佳化：
+  - 完成的結果寫入 `cache/kd_optimize/<完成時間>-<模式>.json`（可用 `KD_OPTIMIZE_RESULT_DIR` 指定），只保留最近 20 筆（`KD_OPTIMIZE_RESULTS_KEPT`）；部署只同步 `app` 資料夾，不會清掉結果
+  - 執行中的工作只存在記憶體，服務重新啟動時會中斷；停止或失敗的工作不存檔
+  - 每組約 0.6 毫秒（實測，依停利方式與主機效能而定）；搜尋在服務的背景執行緒執行，期間其他 API 會稍慢
+  - 上限：隨機抽樣 500,000 組、完整搜尋 2 億組、每個參數 30 個候選值（`market_analysis.py` 最上方的 `OPTIMIZE_*`）
 
 ## 測試
 

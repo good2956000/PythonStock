@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from app import main
 from app.market_data import Sector, build_stock_name_map, split_code_and_name, split_download_frame
+from app.optimize_jobs import OptimizeJobManager
 from app.scan_jobs import STATUS_COMPLETED, STATUS_FAILED, ScanJobManager
 
 API_KEY = "test-key-for-unit-tests"
@@ -72,6 +73,19 @@ class TestSplitDownloadFrame:
 
     def test_empty_download_returns_empty_dict(self):
         assert split_download_frame(pd.DataFrame(), ["2330.TW"]) == {}
+
+
+@pytest.fixture
+def optimize_client(monkeypatch, tmp_path):
+    """最佳化 API 測試用：結果存到暫存資料夾、工作同步執行、股價下載改為假資料。"""
+    monkeypatch.setenv(main.API_KEY_ENV_NAME, API_KEY)
+    manager = OptimizeJobManager(str(tmp_path / "kd_optimize"))
+    synchronous_submit = manager.submit
+    monkeypatch.setattr(manager, "submit", lambda *args, **kwargs: synchronous_submit(*args, background=False, **kwargs))
+    monkeypatch.setattr(main, "optimize_job_manager", manager)
+    monkeypatch.setattr(main.market_data, "download_single_history", lambda ticker, **kwargs: pd.DataFrame({"Close": [1.0]}))
+    monkeypatch.setattr(main.market_analysis, "drop_unclosed_session", lambda frame, now: frame)
+    return TestClient(main.app), manager
 
 
 @pytest.fixture
@@ -263,29 +277,118 @@ class TestAnalysisEndpoints:
         assert (p.atr_period, p.atr_multiplier, p.swing_low_lookback) == (10, 2.5, 30)
         assert (p.transaction_costs_enabled, p.fee_rate_percent, p.fee_discount, p.sell_tax_percent) == (False, 0.1, 0.28, 0.15)
 
-    def test_kd_optimize_passes_settings_and_parameters(self, api_client, monkeypatch):
-        captured = {}
-        monkeypatch.setattr(main.market_data, "download_single_history", lambda ticker, **kwargs: pd.DataFrame({"Close": [1.0]}))
-        monkeypatch.setattr(main.market_analysis, "drop_unclosed_session", lambda frame, now: frame)
-
-        def fake_optimize(twii, etf, parameters, trials, train_ratio, min_trades):
-            captured.update(parameters=parameters, trials=trials, train_ratio=train_ratio, min_trades=min_trades)
-            return {"top": []}
-
-        monkeypatch.setattr(main.market_analysis, "optimize_kd_band", fake_optimize)
-
-        response = api_client.get("/api/market/kd-backtest/optimize?trials=500&trainRatio=0.8&minTrades=3&feeDiscount=0.28",
-                                  headers={"X-Api-Key": API_KEY})
+    def test_kd_optimize_options_return_default_space(self, api_client):
+        response = api_client.get("/api/market/kd-backtest/optimize-options", headers={"X-Api-Key": API_KEY})
 
         assert response.status_code == 200
-        assert (captured["trials"], captured["train_ratio"], captured["min_trades"]) == (500, 0.8, 3)
-        assert captured["parameters"].fee_discount == 0.28
+        options = response.json()
+        assert options["space"]["kdPeriod"] == [5, 7, 9, 12, 14, 18]
+        assert options["space"]["trailingStopMethod"] == ["none", "ma", "percent", "atr", "swing_low"]
+        assert (options["maxTrials"], options["maxValuesPerParameter"]) == (500_000, 30)
 
-    @pytest.mark.parametrize("query", ["trials=5", "trials=20000", "trainRatio=0.3", "trainRatio=0.95", "minTrades=-1", "kdPeriod=1"])
-    def test_kd_optimize_rejects_out_of_range_settings(self, api_client, query):
-        response = api_client.get(f"/api/market/kd-backtest/optimize?{query}", headers={"X-Api-Key": API_KEY})
+    def test_kd_optimize_job_passes_settings_and_saves_result(self, optimize_client, monkeypatch):
+        client, manager = optimize_client
+        captured = {}
+
+        def fake_optimize(twii, etf, parameters, **kwargs):
+            captured.update(parameters=parameters, **kwargs)
+            kwargs["progress"](6, 6, None)
+            return {"mode": kwargs["mode"], "seed": kwargs["seed"], "top": []}
+
+        monkeypatch.setattr(main.market_analysis, "optimize_kd_band", fake_optimize)
+        body = {"mode": "random", "trials": 500, "seed": 48213, "trainRatio": 0.8, "minTrades": 3,
+                "space": {"kdPeriod": [9, 14], "trailingStopMethod": ["none", "atr"], "atrMultiplier": [2, 3], "maPeriod": []}}
+
+        response = client.post("/api/market/kd-backtest/optimize-jobs?startDate=2021-01-04&feeDiscount=0.28",
+                               json=body, headers={"X-Api-Key": API_KEY})
+
+        assert response.status_code == 202
+        job = response.json()
+        # KD 天數 2 種 ×（不使用 1 種 + ATR 倍數 2 種）= 6 組，抽 500 組即全部
+        assert (job["status"], job["totalCount"], job["result"]["seed"]) == ("completed", 6, 48213)
+        assert (captured["mode"], captured["trials"], captured["seed"], captured["train_ratio"], captured["min_trades"]) == (
+            "random", 500, 48213, 0.8, 3)
+        assert captured["parameters"].fee_discount == 0.28
+        # 空清單不搜尋（月線固定為目前設定）
+        assert captured["space"] == {"kd_period": [9, 14], "trailing_stop_method": ["none", "atr"], "atr_multiplier": [2.0, 3.0]}
+        saved = client.get(f"/api/market/kd-backtest/optimize-results/{job['resultId']}", headers={"X-Api-Key": API_KEY}).json()
+        assert saved["settings"]["startDate"] == "2021-01-04"
+        assert saved["settings"]["space"] == {"kdPeriod": [9, 14], "trailingStopMethod": ["none", "atr"], "atrMultiplier": [2.0, 3.0]}
+        listed = client.get("/api/market/kd-backtest/optimize-results", headers={"X-Api-Key": API_KEY}).json()
+        assert [item["resultId"] for item in listed["results"]] == [job["resultId"]]
+        assert client.get(f"/api/market/kd-backtest/optimize-jobs/{job['jobId']}", headers={"X-Api-Key": API_KEY}).json()["status"] == "completed"
+        assert client.get("/api/market/kd-backtest/optimize-jobs/current", headers={"X-Api-Key": API_KEY}).json() == {"job": None}
+
+    def test_kd_optimize_job_reports_download_failure(self, optimize_client, monkeypatch):
+        client, _ = optimize_client
+        monkeypatch.setattr(main.market_data, "download_single_history", lambda ticker, **kwargs: None)
+
+        job = client.post("/api/market/kd-backtest/optimize-jobs", json={}, headers={"X-Api-Key": API_KEY}).json()
+
+        assert job["status"] == "failed"
+        assert "無法下載" in job["errorMessage"]
+
+    def test_kd_optimize_rejects_exhaustive_search_over_limit(self, optimize_client, monkeypatch):
+        client, _ = optimize_client
+        monkeypatch.setattr(main.market_analysis, "OPTIMIZE_MAX_COMBINATIONS", 100)
+
+        response = client.post("/api/market/kd-backtest/optimize-jobs", json={"mode": "exhaustive"}, headers={"X-Api-Key": API_KEY})
+
+        assert response.status_code == 400
+        assert "113,702,400" in response.json()["detail"]
+
+    def test_kd_optimize_rejects_second_job_while_running(self, optimize_client, monkeypatch):
+        client, manager = optimize_client
+
+        def busy(*args, **kwargs):
+            raise main.OptimizeJobConflictError()
+
+        monkeypatch.setattr(manager, "submit", busy)
+
+        response = client.post("/api/market/kd-backtest/optimize-jobs", json={}, headers={"X-Api-Key": API_KEY})
+
+        assert response.status_code == 409
+
+    @pytest.mark.parametrize("body", [
+        {"trials": 5}, {"trials": 600000}, {"trainRatio": 0.3}, {"minTrades": -1}, {"mode": "genetic"}, {"seed": 0},
+        {"space": {"kdPeriod": [1]}}, {"space": {"kdPeriod": [9.5]}}, {"space": {"trailingStopMethod": ["magic"]}},
+        {"space": {"kdPeriod": list(range(2, 40))}}, {"space": {"atrMultiplier": [0]}},
+    ])
+    def test_kd_optimize_rejects_invalid_settings(self, optimize_client, body):
+        client, _ = optimize_client
+
+        response = client.post("/api/market/kd-backtest/optimize-jobs", json=body, headers={"X-Api-Key": API_KEY})
 
         assert response.status_code == 422
+
+    def test_kd_optimize_rejects_invalid_parameters_and_dates(self, optimize_client):
+        client, _ = optimize_client
+
+        assert client.post("/api/market/kd-backtest/optimize-jobs?kdPeriod=1", json={}, headers={"X-Api-Key": API_KEY}).status_code == 422
+        assert client.post("/api/market/kd-backtest/optimize-jobs?startDate=2000-01-01", json={},
+                           headers={"X-Api-Key": API_KEY}).status_code == 400
+
+    @pytest.mark.parametrize("path", ["optimize-jobs/not-a-job-id", "optimize-results/..%2Fsecrets", "optimize-results/20261109-genetic"])
+    def test_kd_optimize_rejects_malformed_ids(self, optimize_client, path):
+        client, _ = optimize_client
+
+        response = client.get(f"/api/market/kd-backtest/{path}", headers={"X-Api-Key": API_KEY})
+
+        assert response.status_code in (404, 422)
+
+    def test_kd_optimize_unknown_job_and_result_return_404(self, optimize_client):
+        client, _ = optimize_client
+
+        assert client.get(f"/api/market/kd-backtest/optimize-jobs/{'0' * 32}", headers={"X-Api-Key": API_KEY}).status_code == 404
+        assert client.post(f"/api/market/kd-backtest/optimize-jobs/{'0' * 32}/cancel", headers={"X-Api-Key": API_KEY}).status_code == 404
+        assert client.get("/api/market/kd-backtest/optimize-results/20261109-140000-random",
+                          headers={"X-Api-Key": API_KEY}).status_code == 404
+
+    def test_kd_optimize_requires_api_key(self, optimize_client):
+        client, _ = optimize_client
+
+        assert client.post("/api/market/kd-backtest/optimize-jobs", json={}).status_code == 401
+        assert client.get("/api/market/kd-backtest/optimize-results").status_code == 401
 
     @pytest.mark.parametrize("query", ["kdPeriod=1", "kSmoothing=0", "maPeriod=500", "buyKThreshold=101", "trendBreakKThreshold=-1",
                                        "trailingStopMethod=magic", "trailingStopSource=tsmc", "trailingMaFilter=x",

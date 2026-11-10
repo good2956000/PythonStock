@@ -184,13 +184,15 @@ class TestOptimize:
         prices = make_wave_prices(days=500)
         base = market_analysis.KdBandParameters(fee_discount=0.5)
 
-        result = market_analysis.optimize_kd_band(prices, prices, base, trials=150, train_ratio=0.7, min_trades=2)
+        result = market_analysis.optimize_kd_band(prices, prices, base, trials=150, seed=7, train_ratio=0.7, min_trades=2)
 
         json.dumps(result)
-        assert result["trials"] == 150
+        assert (result["mode"], result["trials"], result["seed"], result["evaluatedAll"]) == ("random", 150, 7, False)
+        assert result["totalCombinations"] == 113_702_400   # 預設搜尋範圍
         assert result["splitDate"] == prices.index[int(500 * 0.7)].strftime("%Y-%m-%d")
-        # 第一組為目前設定
+        # 目前設定另外列出作為比較基準
         assert parameters_from_camel(result["current"]["parameters"]) == base
+        assert result["current"]["isCurrent"] is True
         top = result["top"]
         assert 0 < len(top) <= market_analysis.OPTIMIZE_TOP_N
         assert [row["trainReturnPercent"] for row in top] == sorted((row["trainReturnPercent"] for row in top), reverse=True)
@@ -216,10 +218,73 @@ class TestOptimize:
     def test_same_seed_gives_same_result(self):
         prices = make_wave_prices(days=400)
 
-        first = market_analysis.optimize_kd_band(prices, prices, trials=50)
-        second = market_analysis.optimize_kd_band(prices, prices, trials=50)
+        first = market_analysis.optimize_kd_band(prices, prices, trials=50, seed=123)
+        second = market_analysis.optimize_kd_band(prices, prices, trials=50, seed=123)
 
-        assert first == second
+        without_time = lambda result: {key: value for key, value in result.items() if key != "elapsedSeconds"}
+        assert without_time(first) == without_time(second)
+
+    def test_without_seed_draws_new_sample_and_reports_seed(self):
+        prices = make_wave_prices(days=400)
+
+        first = market_analysis.optimize_kd_band(prices, prices, trials=50, min_trades=0)
+        second = market_analysis.optimize_kd_band(prices, prices, trials=50, min_trades=0)
+        replay = market_analysis.optimize_kd_band(prices, prices, trials=50, min_trades=0, seed=first["seed"])
+
+        assert 1 <= first["seed"] <= market_analysis.OPTIMIZE_MAX_SEED
+        assert first["seed"] != second["seed"]
+        # 填回回傳的種子即可重現同一份排名
+        assert replay["top"] == first["top"]
+
+    def test_exhaustive_evaluates_every_combination(self):
+        prices = make_wave_prices(days=400)
+        space = {"kd_period": [5, 9], "buy_k_threshold": [20, 30, 40], "trailing_stop_method": ["none", "percent"],
+                 "trailing_drawdown_percent": [5, 10]}
+
+        result = market_analysis.optimize_kd_band(prices, prices, space=space, mode="exhaustive", min_trades=0, top_n=100)
+
+        # 2 × 3 ×（不使用 1 種 + 百分比回撤 2 種）= 18 組
+        assert (result["totalCombinations"], result["trials"], result["evaluatedAll"], result["seed"]) == (18, 18, True, None)
+        assert len(result["top"]) == 18
+        identities = {json.dumps(row["parameters"], sort_keys=True) for row in result["top"]}
+        assert len(identities) == 18
+        assert result["space"]["kdPeriod"] == [5, 9] and result["space"]["trailingDrawdownPercent"] == [5.0, 10.0]
+        # 每一組都與單獨回測的結果相同
+        for row in result["top"][:3]:
+            full = market_analysis.run_kd_band_backtest(prices, prices, parameters_from_camel(row["parameters"]))
+            assert row["fullReturnPercent"] == pytest.approx(full["cumulativeReturnPercent"], abs=0.01)
+
+    def test_random_trials_beyond_space_size_evaluate_everything(self):
+        prices = make_wave_prices(days=400)
+
+        result = market_analysis.optimize_kd_band(prices, prices, space={"kd_period": [5, 9, 14]}, trials=100, min_trades=0)
+
+        assert (result["totalCombinations"], result["trials"], result["evaluatedAll"]) == (3, 3, True)
+
+    def test_marks_current_settings_in_ranking(self):
+        prices = make_wave_prices(days=400)
+        base = market_analysis.KdBandParameters()
+
+        result = market_analysis.optimize_kd_band(prices, prices, base, space={"kd_period": [9]}, mode="exhaustive", min_trades=0)
+
+        assert [row["isCurrent"] for row in result["top"]] == [True]
+
+    def test_reports_progress_and_stops_when_callback_raises(self):
+        prices = make_wave_prices(days=400)
+        reports = []
+
+        market_analysis.optimize_kd_band(prices, prices, trials=450, seed=1, min_trades=0,
+                                         progress=lambda done, total, best: reports.append((done, total, best)))
+
+        assert [done for done, _, _ in reports] == [200, 400, 450]
+        assert all(total == 450 for _, total, _ in reports)
+        assert set(reports[-1][2]) == {"trainReturnPercent", "validationReturnPercent"}
+
+        def stop(done, total, best):
+            raise RuntimeError("stopped")
+
+        with pytest.raises(RuntimeError, match="stopped"):
+            market_analysis.optimize_kd_band(prices, prices, trials=450, seed=1, progress=stop)
 
     def test_min_trades_filters_lucky_combinations(self):
         prices = make_wave_prices(days=400)
@@ -234,6 +299,79 @@ class TestOptimize:
 
         with pytest.raises(ValueError):
             market_analysis.optimize_kd_band(prices, prices, trials=10)
+
+    def test_rejects_unknown_mode(self):
+        prices = make_wave_prices(days=400)
+
+        with pytest.raises(ValueError):
+            market_analysis.optimize_kd_band(prices, prices, mode="genetic")
+
+
+class TestSearchSpace:
+    """搜尋範圍：組合編號、沒用到的停利參數固定、範圍驗證。"""
+
+    def test_default_space_size(self):
+        space = market_analysis.build_search_space(market_analysis.KdBandParameters())
+
+        # 買賣條件 6×4×4×4×6×5×7×5 = 403,200；停利 不使用 1 + 均線 256 + 百分比 6 + ATR 15 + 前波低點 4 = 282
+        assert space.total == 403_200 * 282
+
+    def test_every_index_maps_to_a_distinct_combination(self):
+        base = market_analysis.KdBandParameters(atr_period=14, fee_discount=0.28)
+        space = market_analysis.build_search_space(base, {
+            "kd_period": [5, 9], "ma_period": [10, 20, 60], "trailing_stop_method": ["none", "atr", "swing_low"],
+            "atr_period": [10, 20], "atr_multiplier": [2, 3], "swing_low_lookback": [10, 20, 40], "trailing_drawdown_percent": [5],
+        })
+
+        combinations = [space.parameters_at(index) for index in range(space.total)]
+
+        assert space.total == 2 * 3 * (1 + 4 + 3)
+        assert len(set(combinations)) == space.total
+        # 第一個參數（KD 天數）變化最慢，同一組指標天數的編號相鄰
+        assert [p.kd_period for p in combinations] == [5] * 24 + [9] * 24
+        # 沒用到的停利參數固定為目前設定；未搜尋的參數（含交易成本）沿用目前設定
+        assert {p.atr_period for p in combinations if p.trailing_stop_method != "atr"} == {14}
+        # 指定了候選值、但停利方式沒有選用的參數也固定為目前設定
+        assert {p.trailing_drawdown_percent for p in combinations} == {10.0}
+        assert {p.fee_discount for p in combinations} == {0.28}
+
+    def test_unsearched_trailing_method_uses_current_setting(self):
+        base = market_analysis.KdBandParameters(trailing_stop_method="percent")
+        space = market_analysis.build_search_space(base, {"trailing_drawdown_percent": [8, 10, 12]})
+
+        assert space.total == 3
+        assert [p.trailing_drawdown_percent for p in map(space.parameters_at, range(3))] == [8.0, 10.0, 12.0]
+
+    def test_duplicate_values_are_removed(self):
+        space = market_analysis.build_search_space(market_analysis.KdBandParameters(), {"kd_period": [9, 9.0, 14]})
+
+        assert space.searched_camel() == {"kdPeriod": [9, 14]}
+
+    @pytest.mark.parametrize("space", [
+        {"kd_period": [1]}, {"buy_k_threshold": [101]}, {"trailing_drawdown_percent": [0]}, {"kd_period": [9.5]},
+        {"kd_period": ["9"]}, {"atr_multiplier": [float("nan")]}, {"trailing_stop_method": ["magic"]},
+        {"fee_discount": [0.5]}, {"kd_period": list(range(2, 40))},
+    ])
+    def test_rejects_invalid_space(self, space):
+        with pytest.raises(ValueError):
+            market_analysis.build_search_space(market_analysis.KdBandParameters(), space)
+
+    def test_parameters_validate_ranges(self):
+        with pytest.raises(ValueError):
+            market_analysis.KdBandParameters(kd_period=1)
+        with pytest.raises(ValueError):
+            market_analysis.KdBandParameters(atr_multiplier=0)
+
+    def test_indicator_cache_keeps_most_recent_entries(self):
+        cache = market_analysis.IndicatorCache(max_size=2)
+        calls = []
+        compute = lambda key: cache.get_or_compute(key, lambda: calls.append(key) or key)
+
+        for key in ["a", "b", "a", "c", "b"]:
+            compute(key)
+
+        # a 最近用過所以保留；加入 c 時淘汰 b，之後再用 b 需要重新計算
+        assert calls == ["a", "b", "c", "b"]
 
 
 class TestTrailingStops:

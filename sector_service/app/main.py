@@ -14,7 +14,7 @@ import threading
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from functools import partial
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query
 from pydantic import BaseModel, ConfigDict, Field
@@ -23,6 +23,7 @@ from pydantic.alias_generators import to_camel
 from . import economic_calendar, market_analysis, market_data, signal_analysis
 from .fred_client import FredApiError, FredClient
 from .mops_news import MopsApiError, MopsClient, one_month_before
+from .optimize_jobs import RESULT_ID_PATTERN, OptimizeJobConflictError, OptimizeJobManager
 from .indicators import BOTTOM_BREAKOUT_CONDITIONS, STRATEGY_CLASSIFIERS, STRATEGY_STANDARD, add_indicators
 from .scan_jobs import ScanJobManager
 from .sector_cache import SectorCache
@@ -44,6 +45,11 @@ SECTOR_CACHE_SECONDS = int(os.getenv("SECTOR_CACHE_SECONDS", str(12 * 60 * 60)))
 SECTOR_CACHE_FILE = os.getenv(
     "SECTOR_CACHE_FILE", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache", "sectors.json")
 )
+# KD 波段策略參數最佳化結果存檔位置與保留筆數；預設放在 app 資料夾旁的 cache/kd_optimize/（不受部署覆蓋）
+KD_OPTIMIZE_RESULT_DIR = os.getenv(
+    "KD_OPTIMIZE_RESULT_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache", "kd_optimize")
+)
+KD_OPTIMIZE_RESULTS_KEPT = int(os.getenv("KD_OPTIMIZE_RESULTS_KEPT", "20"))
 DOWNLOAD_CHUNK_DELAY_SECONDS = float(os.getenv("DOWNLOAD_CHUNK_DELAY_SECONDS", "1"))
 TICKER_PATTERN = re.compile(r"^\d{4}\.(TW|TWO)$")
 # 個股分析接受純數字台股代號（自動判斷上市 / 上櫃）、含後綴的台股代號或美股代號
@@ -134,6 +140,7 @@ sector_cache = SectorCache(SECTOR_CACHE_SECONDS, market_data.fetch_sectors, SECT
 job_manager = ScanJobManager(
     price_downloader=partial(market_data.download_price_history, chunk_delay_seconds=DOWNLOAD_CHUNK_DELAY_SECONDS)
 )
+optimize_job_manager = OptimizeJobManager(KD_OPTIMIZE_RESULT_DIR, KD_OPTIMIZE_RESULTS_KEPT)
 
 
 @asynccontextmanager
@@ -146,6 +153,7 @@ async def lifespan(_: FastAPI):
     yield
     _calendar_warm_up_stop.set()
     job_manager.shutdown()
+    optimize_job_manager.shutdown()
 
 
 app = FastAPI(title="Taiwan Stock Strategy API", version="2.0.0", lifespan=lifespan)
@@ -327,17 +335,28 @@ def kd_band_parameters(
     )
 
 
-def _load_kd_prices(start_date: date):
-    """下載加權指數與 0050 日 K；盤中只算到前一個收盤日，避免以即時價產生訊號。"""
+def _validate_kd_start_date(start_date: date) -> None:
     if start_date < date(2005, 1, 1) or start_date >= date.today():
         raise HTTPException(status_code=400, detail="startDate must be between 2005-01-01 and yesterday")
+
+
+def _download_kd_prices(start_date: date):
+    """下載加權指數與 0050 日 K；盤中只算到前一個收盤日，避免以即時價產生訊號。下載失敗回傳 None。"""
     start = start_date.isoformat()
     twii = market_data.download_single_history(INDEX_TICKER, start=start)
     etf = market_data.download_single_history(ETF_TICKER, start=start)
     if twii is None or etf is None:
-        raise HTTPException(status_code=502, detail="Unable to download price data")
+        return None
     taipei_now = datetime.now(TAIPEI_TIMEZONE)
     return market_analysis.drop_unclosed_session(twii, taipei_now), market_analysis.drop_unclosed_session(etf, taipei_now)
+
+
+def _load_kd_prices(start_date: date):
+    _validate_kd_start_date(start_date)
+    prices = _download_kd_prices(start_date)
+    if prices is None:
+        raise HTTPException(status_code=502, detail="Unable to download price data")
+    return prices
 
 
 @app.get("/api/market/kd-backtest", dependencies=[Depends(verify_api_key)])
@@ -350,23 +369,138 @@ def get_kd_backtest(
     return market_analysis.run_kd_band_backtest(twii, etf, parameters)
 
 
-@app.get("/api/market/kd-backtest/optimize", dependencies=[Depends(verify_api_key)])
-def get_kd_backtest_optimization(
+MAX_SEARCH_VALUES = market_analysis.OPTIMIZE_MAX_VALUES_PER_PARAMETER
+
+
+def _search_values(item_type, **limits):
+    """搜尋範圍內單一參數的候選值清單型別（未提供或空清單 = 不搜尋，固定為目前設定）。"""
+    return Optional[Annotated[List[Annotated[item_type, Field(**limits)]], Field(max_length=MAX_SEARCH_VALUES)]]
+
+
+class OptimizeSpaceBody(CamelModel):
+    """各參數的候選值；範圍與回測參數相同。"""
+
+    kd_period: _search_values(int, ge=2, le=60) = None
+    k_smoothing: _search_values(int, ge=1, le=20) = None
+    d_smoothing: _search_values(int, ge=1, le=20) = None
+    ma_period: _search_values(int, ge=2, le=240) = None
+    buy_k_threshold: _search_values(float, ge=0, le=100) = None
+    take_profit_k_threshold: _search_values(float, ge=0, le=100) = None
+    take_profit_bias_percent: _search_values(float, ge=-30, le=50) = None
+    trend_break_k_threshold: _search_values(float, ge=0, le=100) = None
+    trailing_stop_method: _search_values(str, pattern=f"^({'|'.join(market_analysis.TRAILING_STOP_METHODS)})$") = None
+    trailing_ma_period: _search_values(int, ge=2, le=240) = None
+    trailing_ma_filter: _search_values(str, pattern=f"^({'|'.join(market_analysis.MA_FILTERS)})$") = None
+    trailing_ma_confirm_days: _search_values(int, ge=1, le=20) = None
+    trailing_ma_break_percent: _search_values(float, ge=0, le=30) = None
+    trailing_drawdown_percent: _search_values(float, gt=0, le=50) = None
+    atr_period: _search_values(int, ge=2, le=60) = None
+    atr_multiplier: _search_values(float, gt=0, le=10) = None
+    swing_low_lookback: _search_values(int, ge=2, le=120) = None
+
+
+class StartOptimizeBody(CamelModel):
+    mode: str = Field(default=market_analysis.OPTIMIZE_MODE_RANDOM, pattern=f"^({'|'.join(market_analysis.OPTIMIZE_MODES)})$")
+    trials: int = Field(default=market_analysis.OPTIMIZE_TRIALS, ge=10, le=market_analysis.OPTIMIZE_MAX_TRIALS)
+    # 隨機抽樣的亂數種子；未指定時每次重新抽樣（實際使用的種子會回傳，可填回重現結果）
+    seed: Optional[int] = Field(default=None, ge=1, le=market_analysis.OPTIMIZE_MAX_SEED)
+    train_ratio: float = Field(default=market_analysis.OPTIMIZE_TRAIN_RATIO, ge=0.5, le=0.9)
+    min_trades: int = Field(default=market_analysis.OPTIMIZE_MIN_TRADES, ge=0, le=50)
+    # 未提供時使用預設搜尋範圍
+    space: Optional[OptimizeSpaceBody] = None
+
+
+@app.get("/api/market/kd-backtest/optimize-options", dependencies=[Depends(verify_api_key)])
+def get_kd_optimize_options() -> dict:
+    """參數最佳化的預設搜尋範圍與上限，供網頁產生搜尋範圍表單。"""
+    return {
+        "space": market_analysis.build_search_space(market_analysis.KdBandParameters()).searched_camel(),
+        "defaultTrials": market_analysis.OPTIMIZE_TRIALS,
+        "maxTrials": market_analysis.OPTIMIZE_MAX_TRIALS,
+        "maxCombinations": market_analysis.OPTIMIZE_MAX_COMBINATIONS,
+        "maxValuesPerParameter": market_analysis.OPTIMIZE_MAX_VALUES_PER_PARAMETER,
+    }
+
+
+@app.post("/api/market/kd-backtest/optimize-jobs", status_code=202, dependencies=[Depends(verify_api_key)])
+def start_kd_optimize_job(
+    body: StartOptimizeBody,
     start_date: date = Query(default=date(2020, 6, 1), alias="startDate"),
     parameters: market_analysis.KdBandParameters = Depends(kd_band_parameters),
-    trials: int = Query(default=market_analysis.OPTIMIZE_TRIALS, ge=10, le=10000),
-    train_ratio: float = Query(default=market_analysis.OPTIMIZE_TRAIN_RATIO, alias="trainRatio", ge=0.5, le=0.9),
-    min_trades: int = Query(default=market_analysis.OPTIMIZE_MIN_TRADES, alias="minTrades", ge=0, le=50),
 ) -> dict:
-    """隨機搜尋 KD 波段策略參數：依訓練期累積報酬排序，並列出驗證期與全期間報酬。
+    """建立 KD 波段策略參數最佳化背景工作（隨機抽樣或完整搜尋），回傳工作狀態供之後查詢進度。
 
-    目前的參數會列為第一組比較；交易成本與停利判斷價格沿用目前設定，不參與搜尋。
+    目前的參數會列為比較基準；交易成本與停利判斷價格沿用目前設定，不參與搜尋。同一時間只執行一個工作。
     """
-    twii, etf = _load_kd_prices(start_date)
+    _validate_kd_start_date(start_date)
+    space = {key: values for key, values in body.space.model_dump().items() if values} if body.space else None
     try:
-        return market_analysis.optimize_kd_band(twii, etf, parameters, trials=trials, train_ratio=train_ratio, min_trades=min_trades)
+        search = market_analysis.build_search_space(parameters, space)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
+    exhaustive = body.mode == market_analysis.OPTIMIZE_MODE_EXHAUSTIVE
+    if exhaustive and search.total > market_analysis.OPTIMIZE_MAX_COMBINATIONS:
+        raise HTTPException(status_code=400, detail=f"完整搜尋共 {search.total:,} 組，超過上限 "
+                                                    f"{market_analysis.OPTIMIZE_MAX_COMBINATIONS:,} 組，請縮小搜尋範圍")
+    total_count = search.total if exhaustive else min(body.trials, search.total)
+    settings = {
+        "startDate": start_date.isoformat(), "mode": body.mode, "trials": body.trials, "seed": body.seed,
+        "trainRatio": body.train_ratio, "minTrades": body.min_trades, "parameters": parameters.to_camel_dict(),
+        "space": search.searched_camel(),
+    }
+
+    def run(progress):
+        prices = _download_kd_prices(start_date)
+        if prices is None:
+            raise RuntimeError("無法下載加權指數或 0050 股價資料，請稍後再試")
+        twii, etf = prices
+        return market_analysis.optimize_kd_band(
+            twii, etf, parameters, space=space, mode=body.mode, trials=body.trials, seed=body.seed,
+            train_ratio=body.train_ratio, min_trades=body.min_trades, progress=progress)
+
+    try:
+        return optimize_job_manager.submit(body.mode, total_count, settings, run)
+    except OptimizeJobConflictError:
+        raise HTTPException(status_code=409, detail="目前已有參數最佳化在執行中，請等它完成或先停止")
+
+
+@app.get("/api/market/kd-backtest/optimize-jobs/current", dependencies=[Depends(verify_api_key)])
+def get_current_kd_optimize_job() -> dict:
+    """執行中的最佳化工作（沒有時 job 為 null），重新開啟頁面時用來接續顯示進度。"""
+    return {"job": optimize_job_manager.current()}
+
+
+@app.get("/api/market/kd-backtest/optimize-jobs/{job_id}", dependencies=[Depends(verify_api_key)])
+def get_kd_optimize_job(job_id: str = Path(pattern=JOB_ID_PATTERN)) -> dict:
+    """查詢最佳化工作進度；完成後 result 為最佳化結果。"""
+    job = optimize_job_manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="找不到最佳化工作（服務可能已重新啟動）")
+    return job
+
+
+@app.post("/api/market/kd-backtest/optimize-jobs/{job_id}/cancel", dependencies=[Depends(verify_api_key)])
+def cancel_kd_optimize_job(job_id: str = Path(pattern=JOB_ID_PATTERN)) -> dict:
+    """停止最佳化工作（停止的工作不存檔）。"""
+    job = optimize_job_manager.cancel(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="找不到最佳化工作（服務可能已重新啟動）")
+    return job
+
+
+@app.get("/api/market/kd-backtest/optimize-results", dependencies=[Depends(verify_api_key)])
+def list_kd_optimize_results() -> dict:
+    """已存檔的最佳化結果摘要（新到舊）。"""
+    return {"results": optimize_job_manager.list_results()}
+
+
+@app.get("/api/market/kd-backtest/optimize-results/{result_id}", dependencies=[Depends(verify_api_key)])
+def get_kd_optimize_result(result_id: str = Path(pattern=RESULT_ID_PATTERN)) -> dict:
+    """單筆已存檔的最佳化結果（含當時的設定）。"""
+    saved = optimize_job_manager.load_result(result_id)
+    if saved is None:
+        raise HTTPException(status_code=404, detail="找不到最佳化結果")
+    return saved
 
 
 @app.get("/api/market/rebound", dependencies=[Depends(verify_api_key)])

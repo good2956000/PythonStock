@@ -4,9 +4,14 @@
 - analyze_rebound      : 移植自 PythonStock/market_rebound.py （大盤回檔後隔月反彈統計）
 - analyze_margin       : 移植自 PythonStock/market_margin.py  （融資餘額 + 近似融資維持率）
 """
+import heapq
+import math
+import secrets
+import time as timer
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -53,13 +58,45 @@ FEE_RATE_PERCENT = 0.1425                   # 券商手續費率（%）
 FEE_DISCOUNT = 1.0                          # 手續費折扣（1 = 不打折、0.28 = 2.8 折）
 SELL_TAX_PERCENT = 0.1                      # 證券交易稅（%）；ETF 為 0.1%
 
+# 參數允許範圍（與 API 查詢參數驗證相同）：(最小值, 最大值, 最小值是否不含)
+PARAMETER_RANGES = {
+    "kd_period": (2, 60, False),
+    "k_smoothing": (1, 20, False),
+    "d_smoothing": (1, 20, False),
+    "ma_period": (2, 240, False),
+    "buy_k_threshold": (0, 100, False),
+    "take_profit_k_threshold": (0, 100, False),
+    "take_profit_bias_percent": (-30, 50, False),
+    "trend_break_k_threshold": (0, 100, False),
+    "trailing_ma_period": (2, 240, False),
+    "trailing_ma_confirm_days": (1, 20, False),
+    "trailing_ma_break_percent": (0, 30, False),
+    "trailing_drawdown_percent": (0, 50, True),
+    "atr_period": (2, 60, False),
+    "atr_multiplier": (0, 10, True),
+    "swing_low_lookback": (2, 120, False),
+    "fee_rate_percent": (0, 1, False),
+    "fee_discount": (0, 1, False),
+    "sell_tax_percent": (0, 1, False),
+}
+INTEGER_PARAMETERS = ("kd_period", "k_smoothing", "d_smoothing", "ma_period", "trailing_ma_period",
+                      "trailing_ma_confirm_days", "atr_period", "swing_low_lookback")
+
 # 參數最佳化：前段（訓練期）找累積報酬最高的參數，後段（驗證期）檢查是否依然有效
-OPTIMIZE_TRIALS = 2000                      # 預設隨機搜尋組數（每 1000 組約 3 秒）
+OPTIMIZE_MODE_RANDOM = "random"             # 隨機抽樣：從搜尋範圍中不重複抽出指定組數
+OPTIMIZE_MODE_EXHAUSTIVE = "exhaustive"     # 完整搜尋：搜尋範圍內每一組都回測
+OPTIMIZE_MODES = (OPTIMIZE_MODE_RANDOM, OPTIMIZE_MODE_EXHAUSTIVE)
+OPTIMIZE_TRIALS = 20000                     # 預設隨機抽樣組數
+OPTIMIZE_MAX_TRIALS = 500_000               # 隨機抽樣組數上限
+OPTIMIZE_MAX_COMBINATIONS = 200_000_000     # 完整搜尋組合數上限（預設搜尋範圍約 1.14 億組）
+OPTIMIZE_MAX_VALUES_PER_PARAMETER = 30      # 每個參數最多幾個候選值
+OPTIMIZE_MAX_SEED = 2_147_483_647           # 亂數種子上限（網站端以 32 位元整數處理）
 OPTIMIZE_TRAIN_RATIO = 0.7                  # 訓練期占回測交易日比例
 OPTIMIZE_MIN_TRADES = 5                     # 訓練期至少完成幾輪交易（避免只靠一兩筆運氣好的交易）
 OPTIMIZE_TOP_N = 10                         # 回傳前幾名
-OPTIMIZE_RANDOM_SEED = 20260101             # 固定亂數種子：同樣條件每次搜尋結果相同
-# 搜尋範圍（每組參數從各清單隨機挑一個值；交易成本與停利判斷價格沿用頁面設定，不參與搜尋）
+OPTIMIZE_PROGRESS_INTERVAL = 200            # 每回測幾組回報一次進度
+OPTIMIZE_CACHE_SIZE = 1024                  # 指標快取最多保留幾組（搜尋範圍很大時避免記憶體無限增加）
+# 預設搜尋範圍（網頁可自行調整；交易成本與停利判斷價格沿用頁面設定，不參與搜尋）
 OPTIMIZE_SPACE = {
     "kd_period": [5, 7, 9, 12, 14, 18],
     "k_smoothing": [2, 3, 4, 5],
@@ -88,6 +125,10 @@ TRAILING_METHOD_KEYS = {
     TRAILING_STOP_SWING_LOW: ("swing_low_lookback",),
 }
 ALL_TRAILING_KEYS = tuple(key for keys in TRAILING_METHOD_KEYS.values() for key in keys)
+# 買賣條件參數（依序搜尋：指標天數放最前面，同一組指標的組合會連續回測，快取命中率高）
+MAIN_SEARCH_KEYS = ("kd_period", "k_smoothing", "d_smoothing", "ma_period", "buy_k_threshold",
+                    "take_profit_k_threshold", "take_profit_bias_percent", "trend_break_k_threshold")
+CHOICE_OPTIONS = {"trailing_stop_method": TRAILING_STOP_METHODS, "trailing_ma_filter": MA_FILTERS}
 
 
 @dataclass(frozen=True)
@@ -133,13 +174,15 @@ class KdBandParameters:
             raise ValueError(f"Unknown trailing stop source: {self.trailing_stop_source}")
         if self.trailing_ma_filter not in MA_FILTERS:
             raise ValueError(f"Unknown moving average filter: {self.trailing_ma_filter}")
+        for key, (minimum, maximum, exclusive_minimum) in PARAMETER_RANGES.items():
+            value = getattr(self, key)
+            too_small = value <= minimum if exclusive_minimum else value < minimum
+            if too_small or value > maximum:
+                raise ValueError(f"{key} must be between {minimum} and {maximum}: {value}")
 
     def to_camel_dict(self) -> Dict:
         """回傳給網頁的參數（camelCase）。"""
-        return {
-            "".join(part.capitalize() if i else part for i, part in enumerate(key.split("_"))): value
-            for key, value in asdict(self).items()
-        }
+        return {_camel(key): value for key, value in asdict(self).items()}
 
 
 def run_kd_band_backtest(twii: pd.DataFrame, etf: pd.DataFrame, parameters: Optional[KdBandParameters] = None) -> Dict:
@@ -245,17 +288,31 @@ def _prepare_frame(twii: pd.DataFrame, etf: pd.DataFrame) -> pd.DataFrame:
     return frame.dropna(subset=["ETF_0050"])
 
 
-def _cached(cache: Optional[Dict], key: tuple, compute):
-    """最佳化時同一組指標天數只計算一次。"""
-    if cache is None:
-        return compute()
-    if key not in cache:
-        cache[key] = compute()
-    return cache[key]
+class IndicatorCache:
+    """最佳化用的指標快取：同一組指標天數只計算一次，只保留最近使用的 max_size 組，避免記憶體無限增加。"""
+
+    def __init__(self, max_size: int = OPTIMIZE_CACHE_SIZE):
+        self._items: "OrderedDict[tuple, object]" = OrderedDict()
+        self._max_size = max_size
+
+    def get_or_compute(self, key: tuple, compute):
+        if key in self._items:
+            self._items.move_to_end(key)
+            return self._items[key]
+        value = compute()
+        self._items[key] = value
+        if len(self._items) > self._max_size:
+            self._items.popitem(last=False)
+        return value
 
 
-def _generate_signals(frame: pd.DataFrame, p: KdBandParameters, cache: Optional[Dict] = None):
-    """產生每日訊號（1 買進、-1 賣出、0 無）與各賣出條件觸發的日子；只使用今日（T）與昨日（T-1）的資料。"""
+def _cached(cache: Optional[IndicatorCache], key: tuple, compute):
+    """有快取時同一組指標天數只計算一次。"""
+    return compute() if cache is None else cache.get_or_compute(key, compute)
+
+
+def _signal_inputs(frame: pd.DataFrame, p: KdBandParameters, cache: Optional[IndicatorCache]) -> Dict[str, np.ndarray]:
+    """只與 KD 天數、平滑天數、月線天數有關的逐日陣列（交叉、乖離、跌破月線），與門檻無關。"""
     def compute_kd():
         # 大盤 KD：先算 RSV，再以 1/平滑天數 為平滑係數計算 K、D（預設 (9, 3, 3) 即傳統 1/3）
         low_min = frame["TWII_L"].rolling(window=p.kd_period).min()
@@ -264,21 +321,35 @@ def _generate_signals(frame: pd.DataFrame, p: KdBandParameters, cache: Optional[
         k = rsv.ewm(alpha=1 / p.k_smoothing, adjust=False).mean()
         return k, k.ewm(alpha=1 / p.d_smoothing, adjust=False).mean()
 
-    k, d = _cached(cache, ("kd", p.kd_period, p.k_smoothing, p.d_smoothing), compute_kd)
-    # 月線與正乖離率 (Close - MA) / MA
-    sma = _cached(cache, ("sma", p.ma_period), lambda: frame["TWII_C"].rolling(window=p.ma_period).mean())
-    bias = (frame["TWII_C"] - sma) / sma * 100
+    def compute():
+        k, d = _cached(cache, ("kd", p.kd_period, p.k_smoothing, p.d_smoothing), compute_kd)
+        # 月線與正乖離率 (Close - MA) / MA
+        sma = _cached(cache, ("sma", p.ma_period), lambda: frame["TWII_C"].rolling(window=p.ma_period).mean())
+        close = frame["TWII_C"]
+        previous_k, previous_d = k.shift(1), d.shift(1)
+        return {
+            "k": k.to_numpy(),
+            "previousK": previous_k.to_numpy(),
+            "goldenCross": ((k > d) & (previous_k <= previous_d)).to_numpy(),   # 今日 K > D 且 昨日 K <= D
+            "deathCross": ((k < d) & (previous_k >= previous_d)).to_numpy(),    # 今日 K < D 且 昨日 K >= D
+            "bias": ((close - sma) / sma * 100).to_numpy(),
+            "maBreak": ((close < sma) & (close.shift(1) >= sma.shift(1))).to_numpy(),   # 今日收盤 < 月線 且 昨日收盤 >= 昨日月線
+        }
 
-    previous_k, previous_d = k.shift(1), d.shift(1)
-    golden_cross = (k > d) & (previous_k <= previous_d)   # 今日 K > D 且 昨日 K <= D
-    death_cross = (k < d) & (previous_k >= previous_d)    # 今日 K < D 且 昨日 K >= D
+    return _cached(cache, ("signalInputs", p.kd_period, p.k_smoothing, p.d_smoothing, p.ma_period), compute)
 
-    # 買進：KD 黃金交叉 且 昨日 K < 低檔門檻
-    buy_signal = golden_cross & (previous_k < p.buy_k_threshold)
-    # 賣出 A（高檔過熱死叉）：死亡交叉 且 昨日 K > 高檔門檻 且 今日月線正乖離 > 門檻
-    sell_take_profit = death_cross & (previous_k > p.take_profit_k_threshold) & (bias > p.take_profit_bias_percent)
-    # 賣出 B（趨勢轉弱）：今日收盤 < 月線 且 昨日收盤 >= 昨日月線 且 今日 K < 門檻
-    sell_trend_break = (frame["TWII_C"] < sma) & (frame["TWII_C"].shift(1) >= sma.shift(1)) & (k < p.trend_break_k_threshold)
+
+def _generate_signals(frame: pd.DataFrame, p: KdBandParameters, cache: Optional[IndicatorCache] = None):
+    """產生每日訊號（1 買進、-1 賣出、0 無）與各賣出條件觸發的日子；只使用今日（T）與昨日（T-1）的資料。"""
+    inputs = _signal_inputs(frame, p, cache)
+    with np.errstate(invalid="ignore"):   # 指標暖身期為 NaN，比較結果為 False（不產生訊號）
+        # 買進：KD 黃金交叉 且 昨日 K < 低檔門檻
+        buy_signal = inputs["goldenCross"] & (inputs["previousK"] < p.buy_k_threshold)
+        # 賣出 A（高檔過熱死叉）：死亡交叉 且 昨日 K > 高檔門檻 且 今日月線正乖離 > 門檻
+        sell_take_profit = (inputs["deathCross"] & (inputs["previousK"] > p.take_profit_k_threshold)
+                            & (inputs["bias"] > p.take_profit_bias_percent))
+        # 賣出 B（趨勢轉弱）：今日收盤 < 月線 且 昨日收盤 >= 昨日月線 且 今日 K < 門檻
+        sell_trend_break = inputs["maBreak"] & (inputs["k"] < p.trend_break_k_threshold)
 
     # 賣出 C（移動停利）需要知道是否持有與進場後的最高價，逐日模擬持倉
     # 買進 1、賣出 -1（同日同時成立時以賣出為準，與原腳本相同）
@@ -287,112 +358,247 @@ def _generate_signals(frame: pd.DataFrame, p: KdBandParameters, cache: Optional[
         trailing_key = ("trailing", p.trailing_stop_source, p.trailing_ma_period, p.trailing_ma_filter,
                         p.trailing_ma_confirm_days, p.trailing_ma_break_percent, p.atr_period, p.swing_low_lookback)
         trailing_series = _cached(cache, trailing_key, lambda: _trailing_stop_series(frame, p))
-    signals, trailing_hit = _simulate_signals(
-        buy_signal.to_numpy(), (sell_take_profit | sell_trend_break).to_numpy(), trailing_series, p)
+    signals, trailing_hit = _simulate_signals(buy_signal, sell_take_profit | sell_trend_break, trailing_series, p)
     return signals, {
-        "takeProfit": sell_take_profit.to_numpy(),
-        "trendBreak": sell_trend_break.to_numpy(),
+        "takeProfit": sell_take_profit,
+        "trendBreak": sell_trend_break,
         "trailingStop": trailing_hit,
     }
 
 
-def _equity_curve(frame: pd.DataFrame, signals: np.ndarray, p: KdBandParameters):
+def _equity_curve(frame: pd.DataFrame, signals: np.ndarray, p: KdBandParameters, cache: Optional[IndicatorCache] = None):
     """依訊號計算每日部位與累積報酬（淨值，起始為 1）。
 
     T 日收盤出現訊號，T+1 日以收盤價成交（與每輪交易表相同），避免用訊號當天的收盤價成交；
     成交日扣交易成本：買進扣手續費，賣出扣手續費 + 證交稅。
     """
-    signal_state = pd.Series(signals, dtype=float).replace(0, np.nan).ffill().replace(-1, 0).fillna(0).to_numpy()
+    signals = np.asarray(signals)
+    # 每天沿用最近一次訊號：最近一次為買進則持有，賣出或尚無訊號則空手
+    last_signal_index = np.maximum.accumulate(np.where(signals != 0, np.arange(len(signals)), 0))
+    signal_state = np.where(signals[last_signal_index] == 1, 1.0, 0.0)
     held_after_close = np.concatenate(([0.0], signal_state[:-1]))          # 第 d 日收盤成交後是否持有
     position_change = np.diff(held_after_close, prepend=0.0)               # +1 買進成交日、-1 賣出成交日
     position = np.concatenate(([0.0], held_after_close[:-1]))              # 第 d 日的漲跌是否計入（前一日收盤已持有）
     trade_cost = np.where(position_change > 0, p.buy_cost_rate, np.where(position_change < 0, p.sell_cost_rate, 0.0))
-    daily_return = frame["ETF_0050"].pct_change().fillna(0).to_numpy()
+    daily_return = _cached(cache, ("dailyReturn",), lambda: frame["ETF_0050"].pct_change().fillna(0).to_numpy())
     cumulative = np.cumprod((1 + daily_return * position) * (1 - trade_cost))
     return position, position_change, cumulative
+
+
+def _camel(key: str) -> str:
+    return "".join(part.capitalize() if i else part for i, part in enumerate(key.split("_")))
+
+
+@dataclass(frozen=True)
+class SearchSpace:
+    """參數搜尋範圍：每個參數的候選值，未列入搜尋的參數固定為目前設定。
+
+    每組參數對應一個編號（0 ~ total-1）：編號 = 買賣條件參數的組合 × 停利方式（含該方式自己的參數）的組合；
+    沒用到的停利參數固定為目前設定，避免實質相同的組合重複計算。
+    """
+    base: KdBandParameters
+    main_options: Tuple[Tuple[str, Tuple], ...]
+    trailing_options: Tuple[Tuple[str, Tuple[Tuple[str, Tuple], ...], int], ...]   # (停利方式, 該方式的參數與候選值, 組合數)
+    searched: Tuple[Tuple[str, Tuple], ...]                                        # 使用者指定要搜尋的參數
+
+    @property
+    def trailing_count(self) -> int:
+        return sum(count for _, _, count in self.trailing_options)
+
+    @property
+    def total(self) -> int:
+        return math.prod(len(options) for _, options in self.main_options) * self.trailing_count
+
+    def parameters_at(self, index: int) -> KdBandParameters:
+        """第 index 組參數；KD 天數變化最慢，同一組指標天數的組合編號相鄰（快取命中率高）。"""
+        main_index, trailing_index = divmod(index, self.trailing_count)
+        values = {}
+        for key, options in reversed(self.main_options):
+            main_index, position = divmod(main_index, len(options))
+            values[key] = options[position]
+        for method, method_options, count in self.trailing_options:
+            if trailing_index < count:
+                values["trailing_stop_method"] = method
+                for key, options in reversed(method_options):
+                    trailing_index, position = divmod(trailing_index, len(options))
+                    values[key] = options[position]
+                break
+            trailing_index -= count
+        return replace(self.base, **values)
+
+    def searched_camel(self) -> Dict[str, List]:
+        """回傳給網頁的搜尋範圍（camelCase）。"""
+        return {_camel(key): list(values) for key, values in self.searched}
+
+
+def _normalize_search_value(key: str, value):
+    if key in CHOICE_OPTIONS:
+        if value not in CHOICE_OPTIONS[key]:
+            raise ValueError(f"Invalid {key}: {value!r}")
+        return value
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{key} must be a number: {value!r}")
+    if key in INTEGER_PARAMETERS:
+        if value != int(value):
+            raise ValueError(f"{key} must be an integer: {value!r}")
+        return int(value)
+    return float(value)
+
+
+def build_search_space(base: KdBandParameters, space: Optional[Dict[str, Sequence]] = None) -> SearchSpace:
+    """依目前設定與各參數候選值建立搜尋範圍；space 為 None 時使用 OPTIMIZE_SPACE，空清單代表不搜尋該參數。"""
+    space = OPTIMIZE_SPACE if space is None else space
+    unknown = sorted(set(space) - set(OPTIMIZE_SPACE))
+    if unknown:
+        raise ValueError(f"Unknown search parameters: {unknown}")
+    searched: Dict[str, Tuple] = {}
+    for key in OPTIMIZE_SPACE:   # 依固定順序，讓同樣的範圍產生同樣的編號
+        values = tuple(dict.fromkeys(_normalize_search_value(key, value) for value in space.get(key) or ()))
+        if not values:
+            continue
+        if len(values) > OPTIMIZE_MAX_VALUES_PER_PARAMETER:
+            raise ValueError(f"{key} has more than {OPTIMIZE_MAX_VALUES_PER_PARAMETER} values")
+        for value in values:
+            replace(base, **{key: value})   # 超出允許範圍時丟出 ValueError
+        searched[key] = values
+
+    options_of = lambda key: searched.get(key) or (getattr(base, key),)
+    trailing_options = []
+    for method in options_of("trailing_stop_method"):
+        method_options = tuple((key, options_of(key)) for key in TRAILING_METHOD_KEYS[method])
+        trailing_options.append((method, method_options, math.prod(len(options) for _, options in method_options)))
+    return SearchSpace(
+        base=base,
+        main_options=tuple((key, options_of(key)) for key in MAIN_SEARCH_KEYS),
+        trailing_options=tuple(trailing_options),
+        searched=tuple(searched.items()),
+    )
+
+
+# 進度回報：(已回測組數, 總組數, 目前訓練期最佳的一組或 None)；回呼丟出例外即中止搜尋
+ProgressCallback = Callable[[int, int, Optional[Dict]], None]
 
 
 def optimize_kd_band(
     twii: pd.DataFrame,
     etf: pd.DataFrame,
     base: Optional[KdBandParameters] = None,
+    space: Optional[Dict[str, Sequence]] = None,
+    mode: str = OPTIMIZE_MODE_RANDOM,
     trials: int = OPTIMIZE_TRIALS,
+    seed: Optional[int] = None,
     train_ratio: float = OPTIMIZE_TRAIN_RATIO,
     min_trades: int = OPTIMIZE_MIN_TRADES,
     top_n: int = OPTIMIZE_TOP_N,
-    seed: int = OPTIMIZE_RANDOM_SEED,
+    progress: Optional[ProgressCallback] = None,
 ) -> Dict:
-    """隨機搜尋參數組合，依「訓練期」累積報酬排序，並列出同一組參數在「驗證期」與全期間的報酬。
+    """搜尋參數組合，依「訓練期」累積報酬排序，並列出同一組參數在「驗證期」與全期間的報酬。
 
+    - 隨機抽樣（random）：從搜尋範圍不重複抽出 trials 組；同一個亂數種子每次抽到同一批，未指定種子時隨機產生。
+      trials 大於等於總組合數時，等同完整搜尋。
+    - 完整搜尋（exhaustive）：搜尋範圍內每一組都回測。
     訓練期 = 回測期間前 train_ratio 的交易日，驗證期 = 其餘交易日；排序只看訓練期，驗證期的資料不參與挑選。
     每組參數都在完整資料上回測（指標暖身與持倉可跨越分界日），再切出兩段的淨值變化。
     """
+    if mode not in OPTIMIZE_MODES:
+        raise ValueError(f"Unknown optimize mode: {mode}")
+    if trials < 1:
+        raise ValueError("trials must be at least 1")
     base = base or KdBandParameters()
+    search = build_search_space(base, space)
     frame = _prepare_frame(twii, etf)
     split = int(len(frame) * train_ratio)
     if split < 60 or len(frame) - split < 20:
-        raise ValueError("Backtest period is too short to split into training and validation periods")
+        raise ValueError("回測期間太短，無法切分訓練期與驗證期，請提早回測起始日")
+
+    started = timer.perf_counter()
+    if mode == OPTIMIZE_MODE_RANDOM and seed is None:
+        seed = secrets.randbelow(OPTIMIZE_MAX_SEED) + 1
+    indices = _candidate_indices(search.total, mode, trials, seed)
+    cache = IndicatorCache()
+    current = _evaluate_parameters(frame, base, split, cache)
+
+    # 只保留訓練期報酬最高的 top_n 組（報酬相同時編號小的優先）；完整搜尋組數很大時不必保存每一組
+    best: List[Tuple[float, int, Dict]] = []
+    qualified = 0
+    for order, index in enumerate(indices, start=1):
+        parameters = search.parameters_at(index)
+        row = _evaluate_parameters(frame, parameters, split, cache)
+        if row["trainTrades"] >= min_trades:
+            qualified += 1
+            item = (row["trainReturnPercent"], -order, row)
+            if len(best) < top_n:
+                heapq.heappush(best, item)
+            elif item[:2] > best[0][:2]:
+                heapq.heapreplace(best, item)
+        if progress is not None and order % OPTIMIZE_PROGRESS_INTERVAL == 0:
+            progress(order, len(indices), _progress_best(best))
+    if progress is not None:
+        progress(len(indices), len(indices), _progress_best(best))
+
+    top = [row for _, _, row in sorted(best, key=lambda item: item[:2], reverse=True)]
+    for row in [current] + top:
+        row["isCurrent"] = row["parameters"] == base
+        row["parameters"] = row["parameters"].to_camel_dict()
 
     closes = frame["ETF_0050"].to_numpy()
-    rng = np.random.default_rng(seed)
-    keys = list(OPTIMIZE_SPACE)
-    # 第一組固定為目前頁面上的設定，方便比較
-    candidates = [base]
-    seen = {tuple(getattr(base, key) for key in keys)}
-    attempts = 0
-    while len(candidates) < trials and attempts < trials * 20:
-        attempts += 1
-        values = {key: OPTIMIZE_SPACE[key][rng.integers(len(OPTIMIZE_SPACE[key]))] for key in keys}
-        values = {key: (value.item() if hasattr(value, "item") else value) for key, value in values.items()}
-        # 沒用到的停利參數統一為目前設定，避免實質相同的組合重複計算
-        used = TRAILING_METHOD_KEYS[values["trailing_stop_method"]]
-        values.update({key: getattr(base, key) for key in ALL_TRAILING_KEYS if key not in used})
-        identity = tuple(values[key] for key in keys)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        candidates.append(replace(base, **values))
-
-    cache: Dict = {}
-    evaluated = []
-    for index, parameters in enumerate(candidates):
-        signals, _ = _generate_signals(frame, parameters, cache)
-        _, position_change, curve = _equity_curve(frame, signals, parameters)
-        entries = np.flatnonzero(position_change > 0)
-        exits = np.flatnonzero(position_change < 0)
-        train_trades = int(np.sum(exits <= split))
-        evaluated.append({
-            "isCurrent": index == 0,
-            "parameters": parameters.to_camel_dict(),
-            "trainReturnPercent": to_float((curve[split] / curve[0] - 1) * 100, 2),
-            "validationReturnPercent": to_float((curve[-1] / curve[split] - 1) * 100, 2),
-            "fullReturnPercent": to_float((curve[-1] - 1) * 100, 2),
-            "trainTrades": train_trades,
-            "totalTrades": int(len(exits)),
-            "openPosition": bool(len(entries) > len(exits)),
-            "exposurePercent": to_float(np.mean(np.concatenate(([0.0], (np.cumsum(position_change) > 0)[:-1]))) * 100, 1),
-        })
-
-    qualified = [row for row in evaluated if row["trainTrades"] >= min_trades]
-    ranked = sorted(qualified, key=lambda row: row["trainReturnPercent"], reverse=True)
     buy_hold = lambda start, end: to_float((closes[end] / closes[start] - 1) * 100, 2)
     return {
+        "mode": mode,
+        "seed": seed if mode == OPTIMIZE_MODE_RANDOM else None,
+        "space": search.searched_camel(),
+        "totalCombinations": search.total,
+        "trials": len(indices),
+        "evaluatedAll": len(indices) == search.total,
+        "elapsedSeconds": to_float(timer.perf_counter() - started, 1),
         "startDate": frame.index[0].strftime("%Y-%m-%d"),
         "splitDate": frame.index[split].strftime("%Y-%m-%d"),
         "endDate": frame.index[-1].strftime("%Y-%m-%d"),
         "trainDays": split,
         "validationDays": len(frame) - 1 - split,
-        "trials": len(candidates),
-        "qualifiedTrials": len(qualified),
+        "qualifiedTrials": qualified,
         "minTrades": min_trades,
         "buyAndHold": {
             "trainReturnPercent": buy_hold(0, split),
             "validationReturnPercent": buy_hold(split, len(frame) - 1),
             "fullReturnPercent": buy_hold(0, len(frame) - 1),
         },
-        "current": evaluated[0],
-        "top": ranked[:top_n],
+        "current": current,
+        "top": top,
     }
+
+
+def _candidate_indices(total: int, mode: str, trials: int, seed: Optional[int]) -> Sequence[int]:
+    """要回測的組合編號（由小到大）：完整搜尋為全部；隨機抽樣為不重複抽出 trials 組。"""
+    if mode == OPTIMIZE_MODE_EXHAUSTIVE or trials >= total:
+        return range(total)
+    rng = np.random.default_rng(seed)
+    return np.sort(rng.choice(total, size=trials, replace=False)).tolist()
+
+
+def _evaluate_parameters(frame: pd.DataFrame, parameters: KdBandParameters, split: int, cache: IndicatorCache) -> Dict:
+    """回測一組參數，切出訓練期、驗證期與全期間報酬（parameters 先保留物件，排名確定後才轉成 camelCase）。"""
+    signals, _ = _generate_signals(frame, parameters, cache)
+    _, position_change, curve = _equity_curve(frame, signals, parameters, cache)
+    entry_count = int(np.count_nonzero(position_change > 0))
+    exits = np.flatnonzero(position_change < 0)
+    return {
+        "parameters": parameters,
+        "trainReturnPercent": to_float((curve[split] / curve[0] - 1) * 100, 2),
+        "validationReturnPercent": to_float((curve[-1] / curve[split] - 1) * 100, 2),
+        "fullReturnPercent": to_float((curve[-1] - 1) * 100, 2),
+        "trainTrades": int(np.count_nonzero(exits <= split)),
+        "totalTrades": int(len(exits)),
+        "openPosition": entry_count > len(exits),
+        "exposurePercent": to_float(np.mean(np.concatenate(([0.0], (np.cumsum(position_change) > 0)[:-1]))) * 100, 1),
+    }
+
+
+def _progress_best(best: List[Tuple[float, int, Dict]]) -> Optional[Dict]:
+    if not best:
+        return None
+    row = max(best, key=lambda item: item[:2])[2]
+    return {"trainReturnPercent": row["trainReturnPercent"], "validationReturnPercent": row["validationReturnPercent"]}
 
 
 def _trailing_stop_series(frame: pd.DataFrame, p: KdBandParameters) -> Dict[str, np.ndarray]:
@@ -442,41 +648,44 @@ def _simulate_signals(buy: np.ndarray, base_sell: np.ndarray, series: Optional[D
     trailing_hit = np.zeros(len(buy), dtype=bool)
     if method == TRAILING_STOP_NONE or series is None:
         return np.where(base_sell, -1, np.where(buy, 1, 0)), trailing_hit
-    closes, atr, prior_low, ma_trigger = series["close"], series["atr"], series["priorLow"], series["maTrigger"]
+    # 逐日迴圈改用 Python list 存取（比逐一讀取 numpy 元素快數倍，數值完全相同）
+    closes, atr, prior_low, ma_trigger = (np.asarray(series[key]).tolist() for key in ("close", "atr", "priorLow", "maTrigger"))
+    buy_days, sell_days = np.asarray(buy).tolist(), np.asarray(base_sell).tolist()
     signals = np.zeros(len(buy), dtype=int)
     holding, entry_signal_index = False, -1
-    highest, stop_level = np.nan, np.nan
+    highest, stop_level = math.nan, math.nan
+    drawdown_ratio = 1 - p.trailing_drawdown_percent / 100
 
-    for i in range(len(buy)):
+    for i in range(len(buy_days)):
         hit = False
-        if holding and method != TRAILING_STOP_NONE and i > entry_signal_index:
+        if holding and i > entry_signal_index:
             close = closes[i]
-            is_new_high = np.isnan(highest) or close > highest
+            is_new_high = math.isnan(highest) or close > highest
             if is_new_high:
                 highest = close
             if method == TRAILING_STOP_MOVING_AVERAGE:
                 hit = bool(ma_trigger[i])
             elif method == TRAILING_STOP_PERCENT:
                 # 收盤自進場後最高收盤回落 X% 以上
-                hit = close <= highest * (1 - p.trailing_drawdown_percent / 100)
+                hit = close <= highest * drawdown_ratio
             elif method == TRAILING_STOP_ATR:
                 # 收盤跌破「進場後最高收盤 − N × ATR」
-                hit = not np.isnan(atr[i]) and close < highest - p.atr_multiplier * atr[i]
+                hit = not math.isnan(atr[i]) and close < highest - p.atr_multiplier * atr[i]
             elif method == TRAILING_STOP_SWING_LOW:
                 # 停利點 = 前波低點；每次創新高時上移到最新的前波低點（只上移不下移）
-                if is_new_high and not np.isnan(prior_low[i]):
-                    stop_level = prior_low[i] if np.isnan(stop_level) else max(stop_level, prior_low[i])
-                hit = not np.isnan(stop_level) and close < stop_level
+                if is_new_high and not math.isnan(prior_low[i]):
+                    stop_level = prior_low[i] if math.isnan(stop_level) else max(stop_level, prior_low[i])
+                hit = not math.isnan(stop_level) and close < stop_level
 
-        if base_sell[i] or hit:
+        if sell_days[i] or hit:
             signals[i] = -1
             trailing_hit[i] = hit
             holding = False
-        elif buy[i]:
+        elif buy_days[i]:
             signals[i] = 1
             if not holding:
                 holding, entry_signal_index = True, i
-                highest, stop_level = np.nan, np.nan
+                highest, stop_level = math.nan, math.nan
     return signals, trailing_hit
 
 
