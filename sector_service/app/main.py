@@ -20,13 +20,14 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
-from . import economic_calendar, market_analysis, market_data, signal_analysis
+from . import economic_calendar, market_analysis, market_data, market_valuation, signal_analysis
 from .fred_client import FredApiError, FredClient
 from .mops_news import MopsApiError, MopsClient, one_month_before
 from .optimize_jobs import RESULT_ID_PATTERN, OptimizeJobConflictError, OptimizeJobManager
 from .indicators import BOTTOM_BREAKOUT_CONDITIONS, STRATEGY_CLASSIFIERS, STRATEGY_STANDARD, add_indicators
 from .scan_jobs import ScanJobManager
 from .sector_cache import SectorCache
+from .valuation_data import MarketValuationService, MarketValuationStore, TwseClient, build_snapshot_frame
 
 # 讓本服務各模組的 INFO 以上訊息輸出到 stderr（部署時導向 logs/service.log）
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -50,6 +51,15 @@ KD_OPTIMIZE_RESULT_DIR = os.getenv(
     "KD_OPTIMIZE_RESULT_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache", "kd_optimize")
 )
 KD_OPTIMIZE_RESULTS_KEPT = int(os.getenv("KD_OPTIMIZE_RESULTS_KEPT", "20"))
+# 大盤席勒本益比的每月快照與 CPI 快取；預設放在 app 資料夾旁的 cache/market_valuation/（不受部署覆蓋）
+MARKET_VALUATION_DIR = os.getenv(
+    "MARKET_VALUATION_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache", "market_valuation"),
+)
+# 證交所報表請求間隔（秒）；過於頻繁會被證交所暫時封鎖 IP
+TWSE_REQUEST_DELAY_SECONDS = float(os.getenv("TWSE_REQUEST_DELAY_SECONDS", "3"))
+# 席勒本益比需要的加權指數起始日（證交所個股本益比自 2005-09 起提供）
+CAPE_INDEX_START_DATE = "2005-08-01"
 DOWNLOAD_CHUNK_DELAY_SECONDS = float(os.getenv("DOWNLOAD_CHUNK_DELAY_SECONDS", "1"))
 TICKER_PATTERN = re.compile(r"^\d{4}\.(TW|TWO)$")
 # 個股分析接受純數字台股代號（自動判斷上市 / 上櫃）、含後綴的台股代號或美股代號
@@ -141,6 +151,9 @@ job_manager = ScanJobManager(
     price_downloader=partial(market_data.download_price_history, chunk_delay_seconds=DOWNLOAD_CHUNK_DELAY_SECONDS)
 )
 optimize_job_manager = OptimizeJobManager(KD_OPTIMIZE_RESULT_DIR, KD_OPTIMIZE_RESULTS_KEPT)
+valuation_service = MarketValuationService(
+    MarketValuationStore(MARKET_VALUATION_DIR), TwseClient(TWSE_REQUEST_DELAY_SECONDS).fetch_snapshot
+)
 
 
 @asynccontextmanager
@@ -154,6 +167,7 @@ async def lifespan(_: FastAPI):
     _calendar_warm_up_stop.set()
     job_manager.shutdown()
     optimize_job_manager.shutdown()
+    valuation_service.shutdown()
 
 
 app = FastAPI(title="Taiwan Stock Strategy API", version="2.0.0", lifespan=lifespan)
@@ -529,6 +543,28 @@ def get_margin(days: int = Query(default=60, ge=10, le=120)) -> dict:
     if not records:
         raise HTTPException(status_code=502, detail="Unable to download margin data from TWSE")
     return market_analysis.analyze_margin(index_frame, records)
+
+
+@app.get("/api/market/cape", dependencies=[Depends(verify_api_key)])
+def get_cape() -> dict:
+    """大盤席勒本益比（以個股資料自行彙整的估算值）。
+
+    缺少月份時在背景向證交所補抓（首次約 25 分鐘），期間回傳 ready=false 與進度，前端輪詢即可。
+    """
+    index_frame = market_data.download_single_history(INDEX_TICKER, start=CAPE_INDEX_START_DATE)
+    if index_frame is None:
+        raise HTTPException(status_code=502, detail="無法下載加權指數資料，請稍後再試")
+    index_frame = market_analysis.drop_unclosed_session(index_frame, datetime.now(TAIPEI_TIMEZONE))
+    valuation_service.update_in_background(list(index_frame.index))
+
+    analysis = None
+    cpi = valuation_service.cpi()
+    snapshots = build_snapshot_frame(valuation_service.snapshots(), index_frame["Close"])
+    if cpi is not None and not snapshots.empty:
+        frame = market_valuation.calculate_cape(snapshots, cpi)
+        if frame["cape"].notna().any():
+            analysis = market_valuation.analyze_cape(frame)
+    return {"ready": analysis is not None, "progress": valuation_service.progress(), "analysis": analysis}
 
 
 # ---------------------------------------------------------------------------

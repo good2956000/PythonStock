@@ -13,6 +13,7 @@
 | `stock_all.py` | 大盤 KD 波段回測 0050 | `GET /api/market/kd-backtest` |
 | `market_rebound.py` | 回檔後隔月反彈統計 | `GET /api/market/rebound` |
 | `market_margin.py` | 融資餘額與維持率 | `GET /api/market/margin` |
+| （新功能，非原腳本） | 大盤席勒本益比 | `GET /api/market/cape` |
 | （新功能，非原腳本） | 全球日曆 | `GET /api/calendar`、`/api/calendar/indicators`、`/api/calendar/policy-rates` |
 
 原腳本保留不動，仍可在命令列單獨執行。
@@ -24,8 +25,10 @@
 | `app/indicators.py` | Domain | 族群掃描的指標計算與三種選股策略（純函式） |
 | `app/signal_analysis.py` | Domain | 個股訊號、右側順勢進場計分與動態出場回測 |
 | `app/market_analysis.py` | Domain | 大盤 KD 波段回測、回檔反彈統計、融資維持率估算 |
+| `app/market_valuation.py` | Domain | 大盤席勒本益比：個股盈餘彙整、CPI 平減、10 年平均（估算值） |
 | `app/serialization.py` | Domain | pandas / numpy 結果轉 JSON（NaN → null） |
 | `app/market_data.py` | Infrastructure | 證交所產業清單與融資資料、Yahoo Finance 日 K 下載與快取 |
+| `app/valuation_data.py` | Infrastructure | 席勒本益比資料：證交所 MI_INDEX／MI_QFIIS、主計總處 CPI，背景回補與硬碟快取 |
 | `app/scan_jobs.py` | Application | 背景掃描工作（單一執行緒依序處理） |
 | `app/optimize_jobs.py` | Application | KD 波段策略參數最佳化背景工作（同時只執行一個、可停止、結果存檔） |
 | `app/economic_calendar.py` | Domain | 全球日曆：重要指標清單（中文名稱、重要性）、最新值、政策利率 |
@@ -79,6 +82,7 @@ dotnet run
 | GET | `/api/market/kd-backtest/optimize-results/{resultId}` | | 單筆已存檔結果與當時設定 |
 | GET | `/api/market/rebound` | `period`=2y/5y/10y/max（預設 5y） | |
 | GET | `/api/market/margin` | `days`=10~120（預設 60） | 首次約 30~40 秒，已公布日期會快取 |
+| GET | `/api/market/cape` | 無 | 回傳 `ready`、`progress`、`analysis`；資料未齊時在背景回補，前端輪詢 |
 | GET | `/api/calendar` | `startDate`、`endDate`（最多 92 天）、`scope`=important/all | FRED 發布日程（含未來排程） |
 | GET | `/api/calendar/indicators` | `releaseIds`=10,50,…（最多 50 個） | 重要指標的最新值 / 前值（平行查詢） |
 | GET | `/api/calendar/policy-rates` | | 聯準會、歐洲央行目前利率與上次調整日期 |
@@ -106,6 +110,11 @@ dotnet run
   - 執行中的工作只存在記憶體，服務重新啟動時會中斷；停止或失敗的工作不存檔
   - 每組約 0.6 毫秒（實測，依停利方式與主機效能而定）；搜尋在服務的背景執行緒執行，期間其他 API 會稍慢
   - 上限：隨機抽樣 500,000 組、完整搜尋 2 億組、每個參數 30 個候選值（`market_analysis.py` 最上方的 `OPTIMIZE_*`）
+- 大盤席勒本益比：
+  - 證交所未提供大盤本益比歷史資料，改以每月最後交易日的個股收盤價 × 發行股數加權彙整（估算值；虧損公司盈餘以 0 計，本益比略偏低）
+  - 每月 2 次證交所請求，間隔 `TWSE_REQUEST_DELAY_SECONDS`（預設 3 秒）；首次回補 2005-09 起約 255 個月，需數十分鐘
+  - 每月結果寫入 `cache/market_valuation/snapshots.json`，CPI 寫入 `cpi.json`（每 24 小時更新，可用 `MARKET_VALUATION_DIR` 指定位置）；部署不會清掉
+  - 抓取失敗的月份 1 小時內不重試；CPI 下載失敗時沿用快取
 
 ## 測試
 
